@@ -256,13 +256,22 @@ pub fn validate(rewrites: &[Rewrite]) -> Result<(), String> {
     Ok(())
 }
 
-/// 本地降级: 把每个已实现的开关各提一次。
+/// 本地降级: 把还没试过的已实现开关各提一次。
 ///
 /// 这一层的开关数量是个位数, 没必要随机采样 —— 穷举反而更好解释。
-pub fn local_proposals(n: usize) -> Vec<Proposal> {
+///
+/// **必须避开历史**: 已实现的开关目前只有一个, 不看历史的话第二代会原样再提
+/// 一遍同一个候选, 换回来的是一轮重复的真机 A/B 和两条一模一样的档案记录。
+/// 提不出新的就回空 —— 由调用方把"已经全试过了"如实写进报告, 而不是
+/// 拿重复候选把代数凑满。
+pub fn local_proposals(n: usize, history: &[super::sysparam::History]) -> Vec<Proposal> {
+    let tried: BTreeSet<&str> = history
+        .iter()
+        .flat_map(|h| h.params.keys().map(String::as_str))
+        .collect();
     CATALOG
         .iter()
-        .filter(|k| k.status == KnobStatus::Landed)
+        .filter(|k| k.status == KnobStatus::Landed && !tried.contains(k.id))
         .take(n)
         .map(|k| Proposal {
             why: format!("本地降级产出: 单独验证 {} ({})", k.id, k.why),
@@ -319,7 +328,7 @@ impl Proposer<'_> {
             }
         }
         if batch.accepted.is_empty() {
-            batch.accepted = local_proposals(n as usize);
+            batch.accepted = local_proposals(n as usize, history);
             batch.origin = Some(super::sysparam::Origin::LocalMutation);
         }
         batch
@@ -416,9 +425,41 @@ mod tests {
 
     #[test]
     fn the_local_fallback_only_proposes_landed_knobs() {
-        for p in local_proposals(5) {
+        for p in local_proposals(5, &[]) {
             validate(&p.rewrites).unwrap();
         }
+    }
+
+    /// 试过的开关不再重提。已实现的开关只有一个, 不看历史的话第二代会原样
+    /// 再提一遍 —— 那是一轮重复的真机 A/B 加两条一样的档案记录。
+    #[test]
+    fn the_local_fallback_never_repeats_a_knob_it_already_tried() {
+        let first = local_proposals(3, &[]);
+        assert!(!first.is_empty());
+        let history: Vec<super::super::sysparam::History> = first
+            .iter()
+            .map(|p| super::super::sysparam::History {
+                params: p
+                    .rewrites
+                    .iter()
+                    .map(|r| (r.knob.clone(), "on".to_string()))
+                    .collect(),
+                verdict: "REJECT".into(),
+                reason: String::new(),
+                per_metric: vec![],
+            })
+            .collect();
+        for p in local_proposals(3, &history) {
+            for r in &p.rewrites {
+                assert!(
+                    !first.iter().any(|f| f.rewrites.iter().any(|x| x.knob == r.knob)),
+                    "又提了一遍试过的 {}",
+                    r.knob
+                );
+            }
+        }
+        // 已实现的开关全试过之后, 提不出新的就回空 —— 不拿重复候选凑代数。
+        assert!(local_proposals(3, &history).len() < first.len());
     }
 
     #[test]

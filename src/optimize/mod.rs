@@ -138,7 +138,10 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
 
     // ---- 2. 开路 + 排计划 ----
     println!("\n[2/4] 按能力开路...");
-    let plan = plan::build(&caps, cfg.budget);
+    let mut plan = plan::build(&caps, cfg.budget, cfg.use_llm);
+    // 画质真值跟着冻结条件走, 不是某一层的私有参数: 灰档的每一个改写都动画面,
+    // 那一层的 psnr 约束没有真值就判不了。
+    plan.conditions.quality_reference = cfg.quality_reference.clone();
     println!("\n{}", plan::render(&plan, &caps));
 
     if cfg.plan_only {
@@ -159,6 +162,7 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
                 evaluated: 0,
                 kept: 0,
                 aborted: 0,
+                eval_errors: vec![],
             })
             .chain(plan.skipped.iter().map(|s| {
                 report::LayerOutcome::unused(s.layer, s.reason.clone(), s.blockers.clone())
@@ -212,23 +216,42 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
 
     for step in &plan.steps {
         println!("\n  --- {} ---", step.layer_display);
+        let ctx = LayerCtx {
+            cfg,
+            caps: &caps,
+            plan: &plan,
+            step,
+            generator: generator.as_ref(),
+            serial: &serial,
+            driver: &driver,
+            support: &support,
+        };
+        // 一层出错不该把已经落袋的测量一起带走。跑到这里的每一份报告都
+        // 代表几十分钟真机时间, 为了一个起不来的子进程把它们全丢掉,
+        // 换回来的是"什么都没有"而不是"少了一层"。
         let outcome = match step.layer {
-            Kind::Sysparam => run_sysparam(
-                cfg, &caps, &plan, step, generator.as_ref(), &serial, &driver, &support,
-                &mut archive,
-            ),
-            Kind::Gray => run_gray(
-                cfg, &caps, &plan, step, generator.as_ref(), &serial, &driver, &support,
-                &mut archive,
-            ),
+            Kind::Sysparam => run_sysparam(&ctx, &mut archive),
+            Kind::Gray => run_gray(&ctx, &mut archive),
+            // ① 不在 plan.steps 里 (见 plan::drives), 真进来了说明计划排错了。
             Kind::Shader => Ok(report::LayerOutcome::unused(
                 Kind::Shader,
-                "画面算子的自主进化闭环在本仓库另有入口 (`game_opt_loop --track sr ...`), \
-                 optimize 这一版只负责把它排进计划, 不代跑",
+                "画面算子由本仓库的自主进化闭环单独跑, optimize 不代跑",
                 vec!["用 `game_opt_loop --track sr --carrier refbench ...` 单独跑".into()],
             )),
-        }?;
-        layers.push(outcome);
+        };
+        layers.push(match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                println!("      这一层中断: {e}");
+                let mut o = report::LayerOutcome::unused(
+                    step.layer,
+                    format!("这一层中途出错, 已停下并保留前面的结果: {e}"),
+                    vec![],
+                );
+                o.route = Some(step.route.clone());
+                o
+            }
+        });
     }
     for s in &plan.skipped {
         layers.push(report::LayerOutcome::unused(
@@ -327,43 +350,119 @@ fn per_metric_lines(r: &eval::Report) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// 跑一层要用到的全部东西。
+///
+/// 收成一个结构体不是为了少敲字, 是为了让两个层跑器的签名一眼看得出
+/// "它们吃的是同一份上下文" —— 八个平行参数排在那里时, 两边漏传一个
+/// 不同的参数是编译期看不出来的。
+struct LayerCtx<'a> {
+    cfg: &'a Config,
+    caps: &'a caps::Caps,
+    plan: &'a plan::Plan,
+    step: &'a plan::Step,
+    generator: Option<&'a crate::engine::generator::Generator>,
+    serial: &'a str,
+    driver: &'a eval::EvalDriver,
+    support: &'a eval::EvalSupport,
+}
+
+impl LayerCtx<'_> {
+    fn new_outcome(&self) -> report::LayerOutcome {
+        report::LayerOutcome {
+            layer: self.step.layer,
+            layer_display: self.step.layer_display,
+            used: true,
+            reason: self.step.why.clone(),
+            blockers: vec![],
+            route: Some(self.step.route.clone()),
+            proposer: None,
+            llm_error: None,
+            proposed: 0,
+            rejected_locally: vec![],
+            evaluated: 0,
+            kept: 0,
+            aborted: 0,
+            eval_errors: vec![],
+        }
+    }
+
+    /// 接收端认不认统一测评接口。
+    ///
+    /// 在开跑之前问一次, 不在每个候选里问: 放在候选循环里的话, 某一代一个
+    /// 候选都没提出来时这道检查根本不会执行, 于是这一层会被报成
+    /// "用了, 0 个候选", 既没有数字也没有理由。
+    fn receiver_missing(&self) -> Option<report::LayerOutcome> {
+        if self.support.is_supported() {
+            return None;
+        }
+        let mut out = self.new_outcome();
+        out.used = false;
+        out.reason = format!(
+            "接收端还没有统一测评接口, 这一层跑不了 ({})",
+            self.support.describe()
+        );
+        out.blockers = vec!["phonefarm 补上 `eval --request <json> --json`".into()];
+        println!("      {}", out.reason);
+        Some(out)
+    }
+
+    /// 下发一个候选。失败只回 Err, 由调用方记进 `eval_errors` 并接着跑下一个。
+    fn evaluate(&self, id: &str, req: &Request) -> Result<eval::Report> {
+        let path = self
+            .cfg
+            .out_dir
+            .join("requests")
+            .join(format!("{id}.json"));
+        self.driver.evaluate(req, &path)
+    }
+}
+
+/// 把这一代的出主意来路并进层结果。
+///
+/// **累加而不是覆盖**: 三代里有两代用了大模型、一代降级到本地变异器时,
+/// 覆盖会让整层被报成"本地变异器", 报告与实际发生的事对不上。
+fn record_proposer(
+    out: &mut report::LayerOutcome,
+    origins: &mut Vec<sysparam::Origin>,
+    origin: Option<sysparam::Origin>,
+    llm_error: Option<&String>,
+) {
+    if let Some(o) = origin {
+        origins.push(o);
+    }
+    let llm = origins
+        .iter()
+        .filter(|o| **o == sysparam::Origin::Llm)
+        .count();
+    let local = origins.len() - llm;
+    out.proposer = Some(match (llm, local) {
+        (0, _) => "本地确定性变异器".to_string(),
+        (_, 0) => "大模型".to_string(),
+        (l, n) => format!("大模型 {l} 代 / 本地变异器 {n} 代"),
+    });
+    // LLM 的岔子留第一条: 后面几代多半是同一个原因, 覆盖成最后一条会让
+    // "第一次为什么降级"这个真正有用的信息丢掉。
+    if out.llm_error.is_none() {
+        out.llm_error = llm_error.cloned();
+    }
+}
+
+/// ③ 系统参数层。
 fn run_sysparam(
-    cfg: &Config,
-    caps: &caps::Caps,
-    plan_: &plan::Plan,
-    step: &plan::Step,
-    generator: Option<&crate::engine::generator::Generator>,
-    serial: &str,
-    driver: &eval::EvalDriver,
-    support: &eval::EvalSupport,
+    ctx: &LayerCtx<'_>,
     archive: &mut Vec<report::Entry>,
 ) -> Result<report::LayerOutcome> {
-    let mut out = report::LayerOutcome {
-        layer: Kind::Sysparam,
-        layer_display: Kind::Sysparam.display(),
-        used: true,
-        reason: step.why.clone(),
-        blockers: vec![],
-        route: Some(step.route.clone()),
-        proposer: None,
-        llm_error: None,
-        proposed: 0,
-        rejected_locally: vec![],
-        evaluated: 0,
-        kept: 0,
-        aborted: 0,
-    };
+    let mut out = ctx.new_outcome();
 
     // 白名单来自真机探测。探测要写节点再还原, 那是接收端的活;
     // 没接上之前只能吃一份已经采好的 probe.txt。
-    let Some(probe_path) = cfg.sysparam_probe.as_ref() else {
+    let Some(probe_path) = ctx.cfg.sysparam_probe.as_ref() else {
         out.used = false;
         out.reason = "白名单还没拿到: 真机探测 (写一个值再还原, 确认内核没把它退回去) \
                       归接收端做, 这一版还没接上"
             .into();
         out.blockers = vec![
-            "接收端补上白名单探测, 或先用 --sysparam-probe <probe.txt> 喂一份已采好的".into(),
+            "接收端补上白名单探测 (payload.probe_only), 或先用 --sysparam-probe <probe.txt> 喂一份已采好的".into(),
         ];
         println!("      {}", out.reason);
         return Ok(out);
@@ -378,54 +477,75 @@ fn run_sysparam(
         return Ok(out);
     }
 
+    // 没做过差异写测试的项要点出来。很多 sysfs 节点接受 write() 但随即被驱动
+    // 夹回原值; 这种项一旦混进来, 跑出来的 REJECT 读起来就像"这个参数没用",
+    // 其实是它根本没改成。
+    let untested: Vec<&String> = wl
+        .iter()
+        .filter(|(_, spec)| spec.effect == "untested" || spec.effect == "skipped_same_value")
+        .map(|(id, _)| id)
+        .collect();
+    if !untested.is_empty() {
+        let note = format!(
+            "{} 项没做过差异写测试 ({}) —— 它们的 REJECT 可能是「没改成」而不是「没用」, \
+             以每轮的 conditions_observed.apply_ok 为准",
+            untested.len(),
+            untested
+                .iter()
+                .take(5)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("      ⚠ {note}");
+        out.blockers.push(note);
+    }
+
+    if let Some(o) = ctx.receiver_missing() {
+        return Ok(o);
+    }
+
     let proposer = sysparam::Proposer {
-        generator,
-        seed: cfg.seed,
+        generator: ctx.generator,
+        seed: ctx.cfg.seed,
     };
     let mut history: Vec<sysparam::History> = Vec::new();
+    let mut origins: Vec<sysparam::Origin> = Vec::new();
 
-    for gen in 1..=step.generations {
+    for gen in 1..=ctx.step.generations {
         let batch = proposer.propose(
-            &device_note(caps),
-            &workload_note(caps),
+            &device_note(ctx.caps),
+            &workload_note(ctx.caps),
             &wl,
             &history,
-            step.children,
+            ctx.step.children,
         );
-        out.proposer = Some(format!("{:?}", batch.origin.unwrap_or(sysparam::Origin::LocalMutation)));
-        if let Some(e) = &batch.llm_error {
-            out.llm_error = Some(e.clone());
-        }
+        record_proposer(&mut out, &mut origins, batch.origin, batch.llm_error.as_ref());
         out.proposed += batch.accepted.len() + batch.rejected.len();
         for (p, why) in &batch.rejected {
-            out.rejected_locally
-                .push(format!("{p:?}: {why}"));
+            out.rejected_locally.push(format!("{p:?}: {why}"));
+        }
+        if batch.accepted.is_empty() {
+            // 提不出新东西就停, 不空转剩下的代数。
+            let note = format!("第 {gen} 代一个可用候选都没提出来, 这一层到此为止");
+            println!("      {note}");
+            out.blockers.push(note);
+            break;
         }
 
         for (i, prop) in batch.accepted.iter().enumerate() {
             let id = format!("sys_g{gen}c{}", i + 1);
-            println!("      {id}: {} — {}", prop.params.len(), prop.why);
-
-            if !support.is_supported() {
-                out.used = false;
-                out.reason = format!(
-                    "接收端还没有统一测评接口, 系统参数这一层跑不了 ({})",
-                    support.describe()
-                );
-                out.blockers = vec!["phonefarm 补上 `eval --request <json> --json`".into()];
-                println!("      {}", out.reason);
-                return Ok(out);
-            }
+            println!("      {id}: {} 项 — {}", prop.params.len(), prop.why);
 
             let req = Request {
                 version: eval::REQUEST_VERSION,
                 kind: Kind::Sysparam,
                 candidate_id: id.clone(),
-                serial: Some(serial.to_string()),
-                package: caps.target.package.clone().unwrap_or_default(),
-                workload: workload_of(step, caps),
-                conditions: plan_.conditions.clone(),
-                protocol: plan::protocol_for(step, caps),
+                serial: Some(ctx.serial.to_string()),
+                package: ctx.caps.target.package.clone().unwrap_or_default(),
+                workload: workload_of(ctx.step, ctx.caps),
+                conditions: ctx.plan.conditions.clone(),
+                protocol: plan::protocol_for(ctx.step, ctx.caps),
                 payload: Payload::Sysparam(eval::SysparamPayload {
                     why: Some(prop.why.clone()),
                     params: prop.params.clone(),
@@ -437,8 +557,15 @@ fn run_sysparam(
                         .collect(),
                 }),
             };
-            let req_path = cfg.out_dir.join("requests").join(format!("{id}.json"));
-            let rep = driver.evaluate(&req, &req_path)?;
+
+            let rep = match ctx.evaluate(&id, &req) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("        → 下发失败, 跳过这个候选: {e}");
+                    out.eval_errors.push(format!("{id}: {e}"));
+                    continue;
+                }
+            };
             out.evaluated += 1;
             if !rep.is_measurement_valid() {
                 out.aborted += 1;
@@ -453,12 +580,16 @@ fn run_sysparam(
                 if rep.kept() { " 留下" } else { "" }
             );
 
-            history.push(sysparam::History {
-                params: prop.params.clone(),
-                verdict: rep.status.clone(),
-                reason: rep.verdict.reason.clone().unwrap_or_default(),
-                per_metric: per_metric_lines(&rep),
-            });
+            // 只有量准了的才喂回给出主意的一方。ABORT 什么都没测到,
+            // 把它当成"这组不行"会让模型学到一条不存在的规律。
+            if rep.is_measurement_valid() {
+                history.push(sysparam::History {
+                    params: prop.params.clone(),
+                    verdict: rep.status.clone(),
+                    reason: rep.verdict.reason.clone().unwrap_or_default(),
+                    per_metric: per_metric_lines(&rep),
+                });
+            }
             archive.push(report::Entry::from_report(
                 id,
                 Kind::Sysparam,
@@ -474,35 +605,12 @@ fn run_sysparam(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_gray(
-    cfg: &Config,
-    caps: &caps::Caps,
-    plan_: &plan::Plan,
-    step: &plan::Step,
-    generator: Option<&crate::engine::generator::Generator>,
-    serial: &str,
-    driver: &eval::EvalDriver,
-    support: &eval::EvalSupport,
-    archive: &mut Vec<report::Entry>,
-) -> Result<report::LayerOutcome> {
-    let mut out = report::LayerOutcome {
-        layer: Kind::Gray,
-        layer_display: Kind::Gray.display(),
-        used: true,
-        reason: step.why.clone(),
-        blockers: vec![],
-        route: Some(step.route.clone()),
-        proposer: None,
-        llm_error: None,
-        proposed: 0,
-        rejected_locally: vec![],
-        evaluated: 0,
-        kept: 0,
-        aborted: 0,
-    };
+/// ② 画面流程改写层。
+fn run_gray(ctx: &LayerCtx<'_>, archive: &mut Vec<report::Entry>) -> Result<report::LayerOutcome> {
+    let mut out = ctx.new_outcome();
 
-    let pf_root = cfg
+    let pf_root = ctx
+        .cfg
         .phonefarm
         .parent()
         .map(PathBuf::from)
@@ -518,23 +626,37 @@ fn run_gray(
         return Ok(out);
     }
 
-    let proposer = gray::Proposer { generator };
-    let mut history: Vec<sysparam::History> = Vec::new();
+    if let Some(o) = ctx.receiver_missing() {
+        return Ok(o);
+    }
 
-    for gen in 1..=step.generations {
+    let proposer = gray::Proposer {
+        generator: ctx.generator,
+    };
+    let mut history: Vec<sysparam::History> = Vec::new();
+    let mut origins: Vec<sysparam::Origin> = Vec::new();
+
+    for gen in 1..=ctx.step.generations {
         let batch = proposer.propose(
-            &device_note(caps),
-            &workload_note(caps),
+            &device_note(ctx.caps),
+            &workload_note(ctx.caps),
             &history,
-            step.children,
+            ctx.step.children,
         );
-        out.proposer = Some(format!("{:?}", batch.origin.unwrap_or(sysparam::Origin::LocalMutation)));
-        if let Some(e) = &batch.llm_error {
-            out.llm_error = Some(e.clone());
-        }
+        record_proposer(&mut out, &mut origins, batch.origin, batch.llm_error.as_ref());
         out.proposed += batch.accepted.len() + batch.rejected.len();
         for (k, why) in &batch.rejected {
             out.rejected_locally.push(format!("{k}: {why}"));
+        }
+        if batch.accepted.is_empty() {
+            // 层里已实现的开关是有限的, 试完就没了。这时候停下来说清楚,
+            // 比把同一个候选再上机一遍诚实。
+            let note = format!(
+                "第 {gen} 代没有新的改写可提 (层里已实现的开关已经全试过), 这一层到此为止"
+            );
+            println!("      {note}");
+            out.blockers.push(note);
+            break;
         }
 
         for (i, prop) in batch.accepted.iter().enumerate() {
@@ -542,26 +664,15 @@ fn run_gray(
             let knobs: Vec<String> = prop.rewrites.iter().map(|r| r.knob.clone()).collect();
             println!("      {id}: {} — {}", knobs.join("+"), prop.why);
 
-            if !support.is_supported() {
-                out.used = false;
-                out.reason = format!(
-                    "接收端还没有统一测评接口, 画面流程改写这一层跑不了 ({})",
-                    support.describe()
-                );
-                out.blockers = vec!["phonefarm 补上 `eval --request <json> --json`".into()];
-                println!("      {}", out.reason);
-                return Ok(out);
-            }
-
             let req = Request {
                 version: eval::REQUEST_VERSION,
                 kind: Kind::Gray,
                 candidate_id: id.clone(),
-                serial: Some(serial.to_string()),
-                package: caps.target.package.clone().unwrap_or_default(),
-                workload: workload_of(step, caps),
-                conditions: plan_.conditions.clone(),
-                protocol: plan::protocol_for(step, caps),
+                serial: Some(ctx.serial.to_string()),
+                package: ctx.caps.target.package.clone().unwrap_or_default(),
+                workload: workload_of(ctx.step, ctx.caps),
+                conditions: ctx.plan.conditions.clone(),
+                protocol: plan::protocol_for(ctx.step, ctx.caps),
                 payload: Payload::Gray(eval::GrayPayload {
                     why: Some(prop.why.clone()),
                     layer: None,
@@ -569,13 +680,19 @@ fn run_gray(
                     // 改写没命中却当成有效样本 = 拿 A 去和 A 比, 稳定产出假阴性。
                     require_hit: true,
                     side_effect_ack: Some(
-                        "debug.vulkan.layers 是全局属性; 层加载成功后立刻清属性, 收尾还原"
-                            .into(),
+                        "debug.vulkan.layers 是全局属性; 层加载成功后立刻清属性, 收尾还原".into(),
                     ),
                 }),
             };
-            let req_path = cfg.out_dir.join("requests").join(format!("{id}.json"));
-            let rep = driver.evaluate(&req, &req_path)?;
+
+            let rep = match ctx.evaluate(&id, &req) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("        → 下发失败, 跳过这个候选: {e}");
+                    out.eval_errors.push(format!("{id}: {e}"));
+                    continue;
+                }
+            };
             out.evaluated += 1;
             if !rep.is_measurement_valid() {
                 out.aborted += 1;
@@ -590,11 +707,17 @@ fn run_gray(
                 if rep.kept() { " 留下" } else { "" }
             );
 
+            // 不管量没量准, 这些开关都算"提过了" —— 否则下一代会原样再提一遍,
+            // 换回来的是同一个候选在真机上再跑一轮。
             history.push(sysparam::History {
                 params: knobs.iter().map(|k| (k.clone(), "on".to_string())).collect(),
                 verdict: rep.status.clone(),
                 reason: format!("{} — {}", knobs.join("+"), prop.why),
-                per_metric: per_metric_lines(&rep),
+                per_metric: if rep.is_measurement_valid() {
+                    per_metric_lines(&rep)
+                } else {
+                    vec!["这一轮没量准 (ABORT), 数字不算数".into()]
+                },
             });
             archive.push(report::Entry::from_report(
                 id,

@@ -104,6 +104,14 @@ pub struct Conditions {
     pub ingame_fps_setting: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_brightness: Option<i64>,
+    /// 画质真值: 真机截帧目录或单张 PNG。
+    ///
+    /// 放在信封上而不是 shader 的 payload 里, 是因为**不止 shader 会动画面**:
+    /// 灰档的每一个改写 (LoadOp / 精度 / 渲染分辨率) 都改画面, 那一层的
+    /// psnr 约束没有真值就判不了。payload 里的同名字段仍然优先, 那是
+    /// 单个候选的一次性覆盖。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_reference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
@@ -661,6 +669,7 @@ mod tests {
                 fan: "unknown".into(),
                 ingame_fps_setting: None,
                 screen_brightness: None,
+                quality_reference: None,
                 notes: None,
             },
             protocol: Protocol::for_kind(kind, 5, 36, 40.0),

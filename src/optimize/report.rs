@@ -130,6 +130,12 @@ pub struct LayerOutcome {
     pub kept: usize,
     /// 测量不算数的那些 (ABORT)。
     pub aborted: usize,
+    /// 下发失败的那些 (进程起不来 / 回包解析不了 / 退出码 2)。
+    ///
+    /// 与 ABORT 又是两回事: ABORT 是"设备上跑了, 但这次不算数",
+    /// 这里是"根本没跑成"。一个候选炸了不该把前面几小时的测量一起带走,
+    /// 所以它只进这份清单, 不往上抛。
+    pub eval_errors: Vec<String>,
 }
 
 impl LayerOutcome {
@@ -148,6 +154,7 @@ impl LayerOutcome {
             evaluated: 0,
             kept: 0,
             aborted: 0,
+            eval_errors: Vec::new(),
         }
     }
 }
@@ -191,6 +198,10 @@ pub fn build(
     plan_only: bool,
 ) -> Report {
     let kept: Vec<String> = archive.iter().filter(|e| e.kept).map(|e| e.id.clone()).collect();
+    // 有效样本与 ABORT 分开数。全是 ABORT 的一轮说"没有任何指标显著改善"
+    // 是错的 —— 那一轮压根没量准, 谈不上改善不改善。
+    let valid = archive.iter().filter(|e| e.measurement_valid).count();
+    let aborted = archive.len() - valid;
     let headline = if plan_only {
         format!(
             "只摸底没改设备: {} 层可开, {} 层开不了",
@@ -199,16 +210,26 @@ pub fn build(
         )
     } else if archive.is_empty() {
         "一个候选都没跑成 —— 见各层的原因".to_string()
+    } else if valid == 0 {
+        format!("{aborted} 个候选全都没量准 (ABORT), 这一轮什么都没学到 —— 见各条的理由")
     } else if kept.is_empty() {
         format!(
-            "跑了 {} 个候选, 一个都没留下 (没有任何指标显著改善, 或存在显著退化)",
-            archive.iter().filter(|e| e.measurement_valid).count()
+            "跑了 {valid} 个有效候选, 一个都没留下 (没有任何指标显著改善, 或存在显著退化){}",
+            if aborted > 0 {
+                format!("; 另有 {aborted} 个没量准, 不计在内")
+            } else {
+                String::new()
+            }
         )
     } else {
         format!(
-            "跑了 {} 个候选, 留下 {} 个",
-            archive.iter().filter(|e| e.measurement_valid).count(),
-            kept.len()
+            "跑了 {valid} 个有效候选, 留下 {} 个{}",
+            kept.len(),
+            if aborted > 0 {
+                format!("; 另有 {aborted} 个没量准, 不计在内")
+            } else {
+                String::new()
+            }
         )
     };
 
@@ -330,6 +351,11 @@ pub fn markdown(r: &Report, caps: &super::caps::Caps) -> String {
             for rej in &l.rejected_locally {
                 o.push_str(&format!("  - 本地打回: {rej}\n"));
             }
+            for err in &l.eval_errors {
+                // "没跑成"与"跑了但不算数"要分开列, 否则读的人会把工装故障
+                // 当成这一层的结论。
+                o.push_str(&format!("  - 下发失败 (没跑成): {err}\n"));
+            }
         }
         o.push('\n');
     }
@@ -429,7 +455,7 @@ pkg_path=package:/data/app/x/base.apk\n";
             },
         );
         let c = caps::assemble(&t, "S1", ROOTED);
-        let p = plan::build(&c, Budget::parse("6h").unwrap());
+        let p = plan::build(&c, Budget::parse("6h").unwrap(), true);
         (c, p)
     }
 
@@ -504,6 +530,56 @@ pkg_path=package:/data/app/x/base.apk\n";
         assert!(!r.archive[0].measurement_valid);
         let md = markdown(&r, &c);
         assert!(md.contains("测量不算数"), "{md}");
+    }
+
+    /// 全是 ABORT 的一轮不能被说成"没有任何指标显著改善" —— 那一轮压根没量准,
+    /// 谈不上改善不改善。这正是本模块反复要分开的两件事。
+    #[test]
+    fn an_all_abort_run_does_not_claim_nothing_improved() {
+        let (c, p) = fixture();
+        let r = build(
+            &p,
+            &c,
+            vec![],
+            vec![entry("g1c1", "ABORT", false), entry("g1c2", "ABORT", false)],
+            false,
+        );
+        assert!(r.headline.contains("没量准"), "{}", r.headline);
+        assert!(
+            !r.headline.contains("显著改善"),
+            "把没量准说成了没改善: {}",
+            r.headline
+        );
+
+        // 混着来的时候, 有效样本与没量准的要分开数。
+        let r = build(
+            &p,
+            &c,
+            vec![],
+            vec![
+                entry("g1c1", "PASS", true),
+                entry("g1c2", "ABORT", false),
+                entry("g1c3", "REJECT", false),
+            ],
+            false,
+        );
+        assert!(r.headline.contains("2 个有效候选"), "{}", r.headline);
+        assert!(r.headline.contains("1 个没量准"), "{}", r.headline);
+    }
+
+    /// "没跑成"与"跑了但不算数"在报告里分开列 —— 混在一起的话, 读的人会把
+    /// 工装故障当成这一层的结论。
+    #[test]
+    fn failed_dispatches_are_listed_apart_from_aborted_measurements() {
+        let (c, p) = fixture();
+        let mut l = LayerOutcome::unused(Kind::Sysparam, "有 root", vec![]);
+        l.used = true;
+        l.proposed = 2;
+        l.evaluated = 1;
+        l.aborted = 1;
+        l.eval_errors = vec!["sys_g1c2: phonefarm eval 退出码 Some(2)".into()];
+        let md = markdown(&build(&p, &c, vec![l], vec![], false), &c);
+        assert!(md.contains("下发失败 (没跑成)"), "{md}");
     }
 
     /// 三层的候选进同一份档案。

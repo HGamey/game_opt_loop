@@ -32,8 +32,15 @@ whichever of them the device allows, and says plainly why it skipped the rest.
 They run in the order ③ → ② → ①. That is not arbitrary: system parameters do
 not touch the image (so image quality need not be measured — cheapest and
 safest), render-flow rewrites do, and image operators are the most expensive
-(compile, inject, quality pass). When the budget runs out, the layer that gets
-cut is the most expensive one, not the most promising one.
+(compile, inject, quality pass). Budget is handed out in that order, split by
+how many layers are still unplanned, with a floor of one candidate each — so a
+tight budget runs the cheap layers and drops the expensive ones rather than
+starving all of them.
+
+**`optimize` drives ③ and ② itself.** ① has its own entry point in this repo
+(`game_opt_loop --track sr --carrier refbench …` — template → mutation → safety
+gate → Pareto archive); `optimize` surveys it, puts it in the plan and tells you
+how to run it, but does not drive it and does not take budget for it.
 
 **If none of the three can be opened, `optimize` measures and writes down why.**
 That is a result, not a failure.
@@ -96,7 +103,7 @@ cargo run --release -- optimize --game com.example.game --package com.example.ga
 | `--game <name>` | `原神` / `genshin` / `refbench` / a carrier directory name / a package name |
 | `--device <serial>` | Target device. Omit **only** when exactly one is online — with several online it refuses rather than guesses |
 | `--package <pkg>` | Package name, when the game name is not recognized. Overrides the built-in table |
-| `--budget <45m\|2h\|900s>` | Real-device time budget. Bare numbers are minutes. Default **30m**, deliberately small |
+| `--budget <45m\|2h\|900s>` | Real-device time budget. Bare numbers are minutes. Default **30m**, deliberately small — enough for one candidate on the cheapest layer |
 | `--plan` | Survey + plan only. **Not a single byte is written to the device** |
 | `--out <dir>` | Artifacts: `caps.json`, `report.json`, `report.md`, `requests/`. Default `runs/optimize` |
 | `--no-llm` | Skip the model, use only the local deterministic mutator |
@@ -254,6 +261,8 @@ Stated plainly so you do not mistake a gap for a bug:
 - **Layer ① is planned but not driven by `optimize`.** The image-operator
   evolution loop has its own entry point in this repo:
   `game_opt_loop --track sr --carrier refbench --generations 3 --children 4`.
+  It appears in the plan under "layers not to run", with that command spelled
+  out, and it consumes no budget.
 - **The render-flow knob catalog lags the layer on purpose.** Only
   `loadop_dont_care` has landed and been verified to bind on real hardware; the
   rest are declared in the contract and refused locally. Proposing a knob the

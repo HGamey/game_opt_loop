@@ -168,6 +168,8 @@ pub fn conditions_from(caps: &Caps) -> Conditions {
         // 游戏内帧率设置同理: 这一版还读不到, 如实留空, 由人补。
         ingame_fps_setting: None,
         screen_brightness: None,
+        // 画质真值由调用方在排完计划之后填 (命令行 --quality-reference)。
+        quality_reference: None,
         notes: None,
     }
 }
@@ -197,9 +199,12 @@ fn workload_seconds(caps: &Caps) -> u64 {
 }
 
 /// 排计划。纯函数。
-pub fn build(caps: &Caps, budget: Budget) -> Plan {
+///
+/// `use_llm` 只影响计划里"谁来出主意"那一行 —— 写死成 llm 的话,
+/// `--plan --no-llm` 会打印并落盘一句不成立的话。
+pub fn build(caps: &Caps, budget: Budget, use_llm: bool) -> Plan {
     let seconds = workload_seconds(caps);
-    // 一对 A/B = 两次"等冷 + 跑负载"。
+    // 一对 A/B = 两次「等冷 + 跑负载」。
     let per_pair_s = 2 * (COOLDOWN_ESTIMATE_S + seconds);
     let per_candidate_s = per_pair_s * MIN_ROUNDS as u64 + PER_CANDIDATE_OVERHEAD_S;
 
@@ -215,13 +220,24 @@ pub fn build(caps: &Caps, budget: Budget) -> Plan {
 
     let mut steps = Vec::new();
     let mut skipped = Vec::new();
-    let open: Vec<&(Kind, &super::caps::LayerVerdict)> =
-        order.iter().filter(|(_, v)| v.open).collect();
-    let share = if open.is_empty() {
-        0
-    } else {
-        budget.seconds / open.len() as u64
-    };
+    // 预算怎么发: **按还剩几层均分, 但至少给得起一个候选**。
+    //
+    // 一开始就三层平分是错的: 三层平分缺省的 30m 是每层 10m, 而一个候选要
+    // 22m —— 于是三层一起被砍, 跟"砍掉最贵的那一层"正好相反, 而且这条命令的
+    // 缺省行为变成了"什么都不做"。
+    //
+    // 纯贪心 (排在前面的层先吃饱) 也是错的: 第一层会把预算吃光, 后面的层
+    // 一个候选都轮不到, 于是"三层自动开路"实际上永远只开第一层。
+    //
+    // 所以按**剩下几层**均分: 轮到某一层时把剩余预算除以还没排的层数,
+    // 除不出一个候选但剩余预算够一个的时候给一个。预算涨上去时各层大致
+    // 均分, 预算紧的时候按顺序一层一个地给, 给不出就砍后面的。
+    let driven_open = order
+        .iter()
+        .filter(|(k, v)| v.open && drives(*k))
+        .count();
+    let mut remaining = driven_open;
+    let mut left = budget.seconds;
 
     for (kind, verdict) in order.iter() {
         if !verdict.open {
@@ -233,15 +249,41 @@ pub fn build(caps: &Caps, budget: Budget) -> Plan {
             });
             continue;
         }
-        // 这一层的份额里塞得下几个候选。轮数不降 —— 降了判定就出不了结论。
-        let fits = share / per_candidate_s.max(1);
+
+        // ① 有自己的入口 (`game_opt_loop --track sr ...`), optimize 不代跑,
+        // 所以它也不该从预算里拿钱 —— 拿了就等于替一件不会发生的事占着时间。
+        if !drives(*kind) {
+            skipped.push(Skipped {
+                layer: *kind,
+                layer_display: kind.display(),
+                reason: format!(
+                    "{} —— 但画面算子的自主进化闭环在本仓库另有入口, optimize 只把它排进计划, 不代跑",
+                    verdict.reason
+                ),
+                blockers: vec![
+                    "用 `game_opt_loop --track sr --carrier refbench --generations 3 --children 4` 单独跑"
+                        .into(),
+                ],
+            });
+            continue;
+        }
+
+        // 这一层塞得下几个候选。轮数不降 —— 降了判定就出不了结论。
+        let share = left / remaining.max(1) as u64;
+        let mut fits = share / per_candidate_s.max(1);
+        if fits == 0 && left >= per_candidate_s {
+            // 均分下来不够一个, 但剩余预算够一个: 给一个。少跑一层不如
+            // 每层都至少试一个方向 —— 一个候选也能判出显著性。
+            fits = 1;
+        }
+        remaining = remaining.saturating_sub(1);
         if fits == 0 {
             skipped.push(Skipped {
                 layer: *kind,
                 layer_display: kind.display(),
                 reason: format!(
-                    "预算不够: 这一层分到 {}, 但一个候选要 {} (每臂 {} 轮不能再少, 否则判定够不着显著性)",
-                    Budget { seconds: share }.human(),
+                    "预算不够: 轮到这一层时只剩 {}, 而一个候选要 {} (每臂 {} 轮不能再少, 否则判定够不着显著性)",
+                    Budget { seconds: left }.human(),
                     Budget {
                         seconds: per_candidate_s
                     }
@@ -249,9 +291,9 @@ pub fn build(caps: &Caps, budget: Budget) -> Plan {
                     MIN_ROUNDS
                 ),
                 blockers: vec![format!(
-                    "想跑这一层, 预算至少要 {}",
+                    "想多跑这一层, 预算每加 {} 多一个候选",
                     Budget {
-                        seconds: per_candidate_s * open.len() as u64
+                        seconds: per_candidate_s
                     }
                     .human()
                 )],
@@ -262,6 +304,8 @@ pub fn build(caps: &Caps, budget: Budget) -> Plan {
         // 多迭代一代更划算。
         let children = fits.clamp(1, 3) as u32;
         let generations = (fits / children as u64).max(1) as u32;
+        let estimate_s = per_candidate_s * (children as u64) * (generations as u64);
+        left = left.saturating_sub(estimate_s);
         steps.push(Step {
             layer: *kind,
             layer_display: kind.display(),
@@ -271,8 +315,12 @@ pub fn build(caps: &Caps, budget: Budget) -> Plan {
             children,
             rounds: MIN_ROUNDS,
             per_candidate_s,
-            estimate_s: per_candidate_s * (children as u64) * (generations as u64),
-            proposer: "llm (挂了退回本地变异器)".into(),
+            estimate_s,
+            proposer: if use_llm {
+                "大模型 (挂了退回本地变异器)".into()
+            } else {
+                "本地确定性变异器 (--no-llm)".into()
+            },
             carrier: carrier_for(*kind, caps),
         });
     }
@@ -293,6 +341,15 @@ pub fn build(caps: &Caps, budget: Budget) -> Plan {
         measure_only: !caps.any_layer_open(),
         pitfalls: caps.target.pitfalls.clone(),
     }
+}
+
+/// optimize 这条命令**自己**驱动哪几层。
+///
+/// ① 画面算子不在内: 它的自主进化闭环 (模板 → 变异 → 防爆门禁 → Pareto 归档)
+/// 在本仓库另有入口, optimize 只负责把它排进计划并说清楚怎么单独跑。
+/// 把它算进预算分配等于替一件不会发生的事占着真机时间。
+pub fn drives(kind: Kind) -> bool {
+    matches!(kind, Kind::Sysparam | Kind::Gray)
 }
 
 /// 一层的冻结统计协议。
@@ -499,8 +556,8 @@ pkg_path=package:/data/app/x/base.apk\n";
     #[test]
     fn the_plan_is_a_pure_function_of_caps() {
         let c = caps_for(ROOTED);
-        let a = build(&c, Budget::parse("3h").unwrap());
-        let b = build(&c, Budget::parse("3h").unwrap());
+        let a = build(&c, Budget::parse("3h").unwrap(), true);
+        let b = build(&c, Budget::parse("3h").unwrap(), true);
         assert_eq!(
             serde_json::to_value(&a.steps).unwrap(),
             serde_json::to_value(&b.steps).unwrap()
@@ -508,24 +565,84 @@ pkg_path=package:/data/app/x/base.apk\n";
     }
 
     #[test]
-    fn a_rooted_device_plans_all_three_layers_when_the_budget_allows() {
-        let plan = build(&caps_for(ROOTED), Budget::parse("6h").unwrap());
-        assert_eq!(plan.steps.len(), 3, "{:?}", plan.skipped);
+    fn a_rooted_device_plans_the_layers_optimize_actually_drives() {
+        let plan = build(&caps_for(ROOTED), Budget::parse("6h").unwrap(), true);
+        assert_eq!(plan.steps.len(), 2, "{:?}", plan.skipped);
         // 顺序: 便宜且不动画面的先跑。
         assert_eq!(plan.steps[0].layer, Kind::Sysparam);
         assert_eq!(plan.steps[1].layer, Kind::Gray);
-        assert_eq!(plan.steps[2].layer, Kind::Shader);
         assert!(!plan.measure_only);
+
+        // ① 能开, 但 optimize 不代跑 —— 它要出现在"不跑的层"里并说清去哪跑,
+        // 而不是悄悄消失。
+        let shader = plan
+            .skipped
+            .iter()
+            .find(|s| s.layer == Kind::Shader)
+            .expect("① 不该从计划里消失");
+        assert!(shader.reason.contains("不代跑"), "{}", shader.reason);
+        assert!(shader.blockers.iter().any(|b| b.contains("--track sr")));
+    }
+
+    /// ① 不从预算里拿钱 —— 拿了就等于替一件不会发生的事占着真机时间,
+    /// 而那会让默认预算下三层一起被砍。
+    #[test]
+    fn the_layer_optimize_does_not_drive_takes_no_budget() {
+        assert!(drives(Kind::Sysparam));
+        assert!(drives(Kind::Gray));
+        assert!(!drives(Kind::Shader));
+
+        // 缺省预算下至少要排得出一层 —— 排不出的话这条命令的默认行为就是
+        // "什么都不做", 而用户看不出那是预算问题还是设备问题。
+        let plan = build(&caps_for(ROOTED), Budget::default(), true);
+        assert!(
+            !plan.steps.is_empty(),
+            "缺省预算 {} 连一层都排不出: {:?}",
+            Budget::default().human(),
+            plan.skipped
+        );
+        assert_eq!(plan.steps[0].layer, Kind::Sysparam, "先跑最便宜的那层");
+    }
+
+    /// 预算**顺序发放**不平分: 排在前面的层先吃饱, 吃不下的留给后面。
+    /// 平分会让三层一起被砍 —— 跟"砍掉最贵的那一层"正好相反。
+    #[test]
+    fn budget_is_handed_out_in_order_not_split_evenly() {
+        let caps = caps_for(ROOTED);
+        let one = build(&caps, Budget::default(), true);
+        assert_eq!(one.steps.len(), 1, "缺省预算只够一层: {:?}", one.skipped);
+        assert!(one
+            .skipped
+            .iter()
+            .any(|s| s.layer == Kind::Gray && s.reason.contains("只剩")));
+
+        // 预算加倍就该多排一层, 而不是两层各减一半。
+        let two = build(&caps, Budget::parse("60m").unwrap(), true);
+        assert_eq!(two.steps.len(), 2, "{:?}", two.skipped);
+        assert_eq!(two.steps[0].rounds, MIN_ROUNDS);
+    }
+
+    /// 计划里"谁来出主意"要跟着 --no-llm 走 —— 写死成大模型的话,
+    /// `--plan --no-llm` 会打印并落盘一句不成立的话。
+    #[test]
+    fn the_plan_says_who_actually_proposes() {
+        let caps = caps_for(ROOTED);
+        let with = build(&caps, Budget::parse("6h").unwrap(), true);
+        assert!(with.steps[0].proposer.contains("大模型"));
+        let without = build(&caps, Budget::parse("6h").unwrap(), false);
+        assert!(without.steps[0].proposer.contains("本地"));
+        assert!(!without.steps[0].proposer.contains("大模型"));
     }
 
     /// 预算不够时砍层, **不降轮数** —— 降了判定就够不着显著性,
     /// 换回来的是一整轮"什么都不显著"。
     #[test]
     fn a_tight_budget_drops_layers_instead_of_rounds() {
-        let plan = build(&caps_for(ROOTED), Budget::parse("10m").unwrap());
+        let plan = build(&caps_for(ROOTED), Budget::parse("10m").unwrap(), true);
         for s in &plan.steps {
             assert_eq!(s.rounds, MIN_ROUNDS);
         }
+        assert!(plan.steps.is_empty(), "10 分钟连一个候选都装不下");
         assert!(!plan.skipped.is_empty(), "预算这么小不该三层都跑");
         // 被砍掉的层必须说清楚差多少。
         for s in &plan.skipped {
@@ -535,7 +652,7 @@ pkg_path=package:/data/app/x/base.apk\n";
 
     #[test]
     fn nothing_open_means_measure_only() {
-        let plan = build(&caps_for(UNROOTED), Budget::parse("6h").unwrap());
+        let plan = build(&caps_for(UNROOTED), Budget::parse("6h").unwrap(), true);
         assert!(plan.steps.is_empty());
         assert!(plan.measure_only);
         assert_eq!(plan.skipped.len(), 3);
@@ -579,7 +696,7 @@ pkg_path=package:/data/app/x/base.apk\n";
     #[test]
     fn the_rendered_plan_explains_every_closed_layer() {
         let c = caps_for(UNROOTED);
-        let text = render(&build(&c, Budget::default()), &c);
+        let text = render(&build(&c, Budget::default(), true), &c);
         assert!(text.contains("不跑的层"));
         assert!(text.contains("root"));
         assert!(text.contains("冻结的测试条件"));

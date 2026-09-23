@@ -61,12 +61,17 @@ fn survey(raw: &'static str, game: &str) -> caps::Caps {
 #[test]
 fn a_plan_run_produces_caps_and_a_report_that_explain_themselves() {
     let caps = survey(ROOTED_NX809J, "原神");
-    let plan = plan::build(&caps, Budget::parse("6h").unwrap());
+    let plan = plan::build(&caps, Budget::parse("6h").unwrap(), true);
 
     // 摸底的结论一路传到计划。
     assert!(caps.device.root.is_true());
-    assert_eq!(plan.steps.len(), 3, "三层都该开: {:?}", plan.skipped);
+    // optimize 自己驱动的两层进 steps; ① 能开但另有入口, 进 skipped 并说清去哪跑。
+    assert_eq!(plan.steps.len(), 2, "{:?}", plan.skipped);
     assert!(!plan.measure_only);
+    assert!(plan
+        .skipped
+        .iter()
+        .any(|s| s.blockers.iter().any(|b| b.contains("--track sr"))));
 
     let layers: Vec<report::LayerOutcome> = plan
         .skipped
@@ -100,7 +105,7 @@ fn a_plan_run_produces_caps_and_a_report_that_explain_themselves() {
 #[test]
 fn when_nothing_can_be_opened_every_reason_reaches_the_report() {
     let caps = survey(UNROOTED, "原神");
-    let plan = plan::build(&caps, Budget::default());
+    let plan = plan::build(&caps, Budget::default(), true);
     assert!(plan.measure_only);
     assert_eq!(plan.skipped.len(), 3);
 
@@ -159,8 +164,8 @@ fn an_unrecognized_game_is_reported_as_unknown_rather_than_guessed() {
 /// 所以可以拿录下来的 caps 做回归。
 #[test]
 fn the_whole_pipeline_is_reproducible_from_a_recorded_probe() {
-    let a = plan::build(&survey(ROOTED_NX809J, "原神"), Budget::parse("2h").unwrap());
-    let b = plan::build(&survey(ROOTED_NX809J, "原神"), Budget::parse("2h").unwrap());
+    let a = plan::build(&survey(ROOTED_NX809J, "原神"), Budget::parse("2h").unwrap(), true);
+    let b = plan::build(&survey(ROOTED_NX809J, "原神"), Budget::parse("2h").unwrap(), true);
     assert_eq!(
         serde_json::to_string(&a.steps).unwrap(),
         serde_json::to_string(&b.steps).unwrap()
