@@ -50,8 +50,8 @@
         "source": { "type": ["string", "null"], "description": "真值的本地来源路径 (单张图或整个目录)" },
         "frames": { "type": "integer", "minimum": 1, "description": "参与平均的帧数" },
         "frame_files": { "type": "array", "items": { "type": "string" }, "description": "逐帧文件名, 按使用顺序" },
-        "candidate_psnr_db": { "type": "array", "items": { "type": "number" }, "description": "候选臂逐帧 PSNR, 与 frame_files 同序。均值即 metrics.psnr_db —— 均值看不出「一组帧里某一张特别差」" },
-        "baseline_psnr_db": { "type": "array", "items": { "type": "number" }, "description": "基线臂逐帧 PSNR, 与 frame_files 同序" }
+        "candidate_psnr_db": { "type": "array", "items": { "type": ["number", "null"] }, "description": "候选臂逐帧 PSNR, 与 frame_files **逐位对齐** (那一张没量到就记 null, 不塌缩 —— 塌缩会让下标跟 frame_files 错开)。均值即 metrics.psnr_db; 均值看不出「一组帧里某一张特别差」" },
+        "baseline_psnr_db": { "type": "array", "items": { "type": ["number", "null"] }, "description": "基线臂逐帧 PSNR, 与 frame_files 逐位对齐" }
       }
     }
   }
