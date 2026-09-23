@@ -243,6 +243,15 @@ fn main() -> Result<()> {
         );
     }
 
+    // 画质真值在本地先看一眼再开跑。这条路径要等到真机跑起来、画质补测那一步
+    // 才会被接收端读到 —— 打错一个字母的代价是几小时之后拿到一批对着程序化图案
+    // 量出来的 dB, 而终端上那行配置照样写着漂亮的目录名。
+    if let Some(r) = cli.quality_reference.as_ref() {
+        let n = count_reference_frames(r)
+            .with_context(|| format!("画质真值 --quality-reference {r} 不可用"))?;
+        println!("      画质真值: {r} ({n} 张参考帧)");
+    }
+
     // ---- 4. 演化 ----
     println!("\n[4/4] 启动自主进化闭环...");
     if cli.dry_run {
@@ -423,6 +432,37 @@ fn run_self_check() -> Result<()> {
     Ok(())
 }
 
+/// 数一眼 `--quality-reference` 指到的地方有几张图。
+///
+/// 只做本地存在性检查, 不解码 —— 尺寸合不合格 (必须 >= 1920x1080) 由接收端
+/// 在裁剪时判, 这里的目的只是别让一个打错的路径拖到几小时之后才暴露。
+fn count_reference_frames(path: &str) -> Result<usize> {
+    let p = std::path::Path::new(path);
+    if p.is_file() {
+        return Ok(1);
+    }
+    if !p.is_dir() {
+        anyhow::bail!("既不是文件也不是目录 (当前工作目录 {:?})", std::env::current_dir()?);
+    }
+    let n = std::fs::read_dir(p)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|f| {
+            f.is_file()
+                && matches!(
+                    f.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .as_deref(),
+                    Some("png" | "jpg" | "jpeg")
+                )
+        })
+        .count();
+    if n == 0 {
+        anyhow::bail!("目录里没有 png/jpg 图片");
+    }
+    Ok(n)
+}
+
 fn print_summary(s: &EvolutionSummary, evo: &Evolution) {
     println!("\n---------- 演化汇总 ----------");
     println!(
@@ -457,10 +497,15 @@ fn print_summary(s: &EvolutionSummary, evo: &Evolution) {
         );
     } else {
         println!(
-            "画质真值: {} (真实帧报告 {} 份 / 程序化图案 {} 份)",
+            "画质真值: {} (真实帧报告 {} 份 / 程序化图案 {} 份{})",
             q.observed.join(" + "),
             q.real_frame_reports,
-            q.procedural_reports
+            q.procedural_reports,
+            if q.unknown_kind_reports > 0 {
+                format!(" / 不认识的来源 {} 份", q.unknown_kind_reports)
+            } else {
+                String::new()
+            }
         );
         // 要了真实帧却一份都没用上 = 那些 dB 不是你以为的那把尺子量的。
         if q.requested.is_some() && q.real_frame_reports == 0 {

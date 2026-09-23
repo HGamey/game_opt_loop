@@ -282,8 +282,8 @@ fn eval_report_carries_where_the_quality_truth_came_from() {
         source: Some("../phonefarm/tasks/genshin_refframes".into()),
         frames: 12,
         frame_files: vec!["frame_00000.png".into(), "frame_00001.png".into()],
-        candidate_psnr_db: vec![31.2, 30.8],
-        baseline_psnr_db: vec![29.1, 28.7],
+        candidate_psnr_db: vec![Some(31.2), None],
+        baseline_psnr_db: vec![Some(29.1), Some(28.7)],
     });
     let v = serde_json::to_value(&report).unwrap();
     assert_conforms(&v, "eval_report.schema.json");

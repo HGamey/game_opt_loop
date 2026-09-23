@@ -194,6 +194,11 @@ pub struct QualityReferenceSummary {
     pub real_frame_reports: usize,
     /// 有多少份报告的画质真值是 runner 内置程序化图案。
     pub procedural_reports: usize,
+    /// 有多少份报告报了本仓库不认识的 `kind`。
+    ///
+    /// 单独数而不是并进 procedural: `kind` 是接收端传过来的字符串,
+    /// 把不认识的值当成程序化图案, 等于替接收端瞎猜, 还会误报告警。
+    pub unknown_kind_reports: usize,
 }
 
 /// 从一批报告里汇总画质真值的来源。
@@ -218,8 +223,10 @@ pub fn summarise_quality_reference<'a>(
         };
         if q.is_real_frames() {
             s.real_frame_reports += 1;
-        } else {
+        } else if q.is_procedural() {
             s.procedural_reports += 1;
+        } else {
+            s.unknown_kind_reports += 1;
         }
         let d = q.describe();
         if !s.observed.contains(&d) {
@@ -227,6 +234,50 @@ pub fn summarise_quality_reference<'a>(
         }
     }
     s
+}
+
+/// 换了画质真值就不能接着用旧档案。
+///
+/// 档案是**追加**的, 跨轮复用; `objectives()` 与 `best_psnr()` 直接比 `psnr_db`,
+/// 不看它是对着哪张参考图量的。一旦混进两种真值, 程序化图案那批 (42.8 dB)
+/// 会永久支配真机截帧那批 (31.3 dB) —— 不是因为它们更清晰, 而是因为量它们的
+/// 尺子不一样。前沿与亲本池就此被钉死在旧数据上, 而每一条记录单看都是对的。
+///
+/// 这跟 `MetricSource` 是同一类问题 (估计值不能和实测值同台比较), 处理也该同一档:
+/// 当场拒绝, 让人换一个 `--out` 目录, 而不是给一个悄悄错掉的前沿。
+pub fn check_archive_quality_reference(
+    archive: &ParetoArchive,
+    requested: Option<&str>,
+) -> Result<()> {
+    // 档案里已有记录用的是哪些真值 (没报来源的记录不参与判断: 成本模型估计值
+    // 与旧版接收端都属于这一类, 它们没声称过自己对着什么量)。
+    let mut seen: Vec<String> = Vec::new();
+    for e in &archive.entries {
+        if let Some(q) = e.report.quality_reference.as_ref() {
+            let key = if q.is_real_frames() {
+                q.source.clone().unwrap_or_else(|| "real_frames".into())
+            } else {
+                q.kind.clone()
+            };
+            if !seen.contains(&key) {
+                seen.push(key);
+            }
+        }
+    }
+    if seen.is_empty() {
+        return Ok(());
+    }
+    let want = requested.unwrap_or("procedural").to_string();
+    if seen.len() == 1 && seen[0] == want {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "里已有的记录是对着 {} 量的画质, 本次要用 {} —— 绝对 dB 不可跨参考图比较, \
+         混在同一个 Pareto 前沿里, 旧记录会仅仅因为尺子不同就永久支配新记录。\n\
+         换一个 --out 目录重新开始, 或把画质真值改回原来那个。",
+        seen.join(" / "),
+        want
+    );
 }
 
 /// 演化引擎。
@@ -257,6 +308,8 @@ impl Evolution {
             config.budget_ms,
             spec.quality_baseline_db,
         );
+        check_archive_quality_reference(&archive, config.quality_reference.as_deref())
+            .with_context(|| format!("档案 {}", archive_path.display()))?;
 
         // LLM 是尽力而为: 拿不到就记下原因, 整代照样用本地变异器推进。
         let (generator, llm_error) = if config.use_llm {
@@ -391,9 +444,16 @@ impl Evolution {
             gen_best_psnr_series: gen_best_series,
             archive_path: self.archive_path.display().to_string(),
             generation_records: record_paths,
+            // 只数**本轮**的报告, 不数整个档案: 档案是跨轮追加的, 上一轮用真机
+            // 参考帧跑过的记录会让这一轮的 real_frame_reports 凭空变正,
+            // 把"要了真实帧却一份都没用上"那条告警压掉 —— 那条告警正是这项汇总
+            // 存在的理由。
             quality_reference: summarise_quality_reference(
                 self.config.quality_reference.clone(),
-                self.archive.entries.iter().map(|e| &e.report),
+                records
+                    .iter()
+                    .flat_map(|r| r.outcomes.iter())
+                    .filter_map(|o| o.report.as_ref()),
             ),
         })
     }
@@ -500,13 +560,16 @@ impl Evolution {
                     } else {
                         rejections.push(RejectionSummary {
                             id: candidate.id.clone(),
+                            // 地板写实际用的那个: 有本场基线实测就是它,
+                            // 没有才是赛道常数。两者能差十几 dB, 不写清楚
+                            // 就看不懂为什么 31.3 dB 过了而 42.8 dB 没过。
                             reason: format!(
-                                "{:?}: 耗时 {:.3} ms (预算 {:.2}), 画质 {:.3} dB (基线 {:.3})",
+                                "{:?}: 耗时 {:.3} ms (预算 {:.2}), 画质 {:.3} dB (地板 {:.3})",
                                 report.status,
                                 report.metrics.operator_latency_ms,
                                 spec.budget_ms,
                                 report.metrics.psnr_db.unwrap_or(f32::NAN),
-                                spec.quality_baseline_db,
+                                report.quality_floor_db(spec.quality_baseline_db),
                             ),
                         });
                     }
@@ -1127,6 +1190,41 @@ mod tests {
         }
     }
 
+    /// 换了画质真值必须当场拒绝接着用旧档案 —— 混在一个前沿里,
+    /// 旧记录会仅仅因为尺子不同就永久支配新记录。
+    #[test]
+    fn a_changed_quality_reference_refuses_to_reuse_the_old_archive() {
+        let cand = Candidate::new(
+            "gen0_baseline",
+            0,
+            "sr",
+            None,
+            1.5,
+            "#version 450\nvoid main() {}".into(),
+            CandidateOrigin::Baseline,
+            None,
+        );
+        let mut archive = ParetoArchive::new("sr", 1.5, 38.666);
+        archive.insert(&cand, report_with(Some(procedural())), now());
+
+        // 同一把尺子继续跑: 放行。
+        assert!(check_archive_quality_reference(&archive, None).is_ok());
+
+        // 换成真机参考帧: 拒绝, 并说清楚该怎么办。
+        let err = check_archive_quality_reference(&archive, Some("tasks/genshin_refframes"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("procedural"), "{err}");
+        assert!(err.contains("--out"), "{err}");
+
+        // 空档案 / 没报来源的记录都不拦: 它们没声称过自己对着什么量。
+        let empty = ParetoArchive::new("sr", 1.5, 38.666);
+        assert!(check_archive_quality_reference(&empty, Some("x")).is_ok());
+        let mut legacy = ParetoArchive::new("sr", 1.5, 38.666);
+        legacy.insert(&cand, report_with(None), now());
+        assert!(check_archive_quality_reference(&legacy, Some("x")).is_ok());
+    }
+
     fn procedural() -> crate::engine::QualityReference {
         crate::engine::QualityReference {
             kind: "procedural".into(),
@@ -1163,6 +1261,25 @@ mod tests {
         let s = summarise_quality_reference(asked, [report_with(Some(procedural()))].iter());
         assert_eq!(s.real_frame_reports, 0);
         assert!(s.requested.is_some());
+    }
+
+    /// 不认识的 `kind` 单独数, 不并进 procedural —— 否则汇总会替接收端瞎猜,
+    /// 还会对着一批真实帧误报"用的是程序化图案"。
+    #[test]
+    fn an_unrecognised_reference_kind_is_counted_separately() {
+        let weird = crate::engine::QualityReference {
+            kind: "real_frame".into(), // 少了个 s
+            source: Some("tasks/genshin_refframes".into()),
+            frames: 12,
+            frame_files: vec![],
+            candidate_psnr_db: vec![],
+            baseline_psnr_db: vec![],
+        };
+        let s = summarise_quality_reference(None, [report_with(Some(weird))].iter());
+        assert_eq!(s.unknown_kind_reports, 1);
+        assert_eq!(s.procedural_reports, 0);
+        assert_eq!(s.real_frame_reports, 0);
+        assert!(s.observed[0].contains("未知真值类型"), "{:?}", s.observed);
     }
 
     #[test]
