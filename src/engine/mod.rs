@@ -164,6 +164,54 @@ pub struct EvalReport {
     pub verdict: Verdict,
     /// 数据来源。序列化后依然带着, 归档里一眼能分辨真机数与估计值。
     pub source: MetricSource,
+    /// `metrics.psnr_db` 是对着哪张 (哪组) 参考图量出来的。
+    ///
+    /// 绝对 dB 不可跨参考图比较: 同一个算子在 runner 内置程序化图案上是 42.8 dB,
+    /// 换成真机截帧只剩 31.3 dB —— 真实画面的高频细节远多于合成图案。
+    /// 档案里存了一堆 dB 而不记它们各自的真值出处, 那些数字之间就没法比。
+    ///
+    /// None = 接收端没报 (旧版 phonefarm, 或成本模型估计值)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_reference: Option<QualityReference>,
+}
+
+/// 画质真值的出处, 由 phonefarm 随报告回传。字段与
+/// `contracts/eval_report.schema.json` 的 `quality_reference` 一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualityReference {
+    /// `real_frames` = 真机截帧; `procedural` = runner 内置程序化图案。
+    pub kind: String,
+    /// 真值的本地来源路径 (单张图或整个目录)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// 参与平均的帧数。
+    pub frames: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frame_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_psnr_db: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline_psnr_db: Vec<f64>,
+}
+
+impl QualityReference {
+    /// 画质真值是不是真实游戏画面。
+    pub fn is_real_frames(&self) -> bool {
+        self.kind == "real_frames"
+    }
+
+    /// 一句话的来源描述, 给报告与终端输出用。
+    pub fn describe(&self) -> String {
+        if self.is_real_frames() {
+            format!(
+                "真机参考帧 x{} ({})",
+                self.frames,
+                self.source.as_deref().unwrap_or("来源未标注")
+            )
+        } else {
+            "runner 内置程序化图案 (非真实游戏帧)".to_string()
+        }
+    }
 }
 
 impl EvalReport {
@@ -227,6 +275,7 @@ mod tests {
                 p_value: p,
             },
             source: src,
+            quality_reference: None,
         }
     }
 
