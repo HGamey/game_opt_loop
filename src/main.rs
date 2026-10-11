@@ -597,8 +597,10 @@ fn run_optimize(args: OptimizeArgs) -> Result<()> {
         seed: args.seed,
         quality_reference: args.quality_reference,
         sysparam_probe: args.sysparam_probe,
-        proposers: args.proposer,
-        proposer_timeout_s: args.proposer_timeout_s,
+        proposer: optimize::proposer::Options {
+            specs: args.proposer,
+            timeout_s: args.proposer_timeout_s,
+        },
     };
 
     let outcome = optimize::run(&cfg)?;

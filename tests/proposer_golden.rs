@@ -122,8 +122,7 @@ fn config(root: &Path, seed: u64) -> optimize::Config {
         seed,
         quality_reference: None,
         sysparam_probe: Some(root.join("probe.txt")),
-        proposers: vec![],
-        proposer_timeout_s: 600,
+        proposer: Default::default(),
     }
 }
 

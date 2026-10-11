@@ -802,6 +802,183 @@ pub fn write_evidence(dir: &Path, input: &Input, proposed: &Proposed, screened: 
     );
 }
 
+/// `optimize` 的出方案选项 (`--proposer` / `--proposer-timeout-s`)。
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// 空 = 按 `--no-llm` 选内置 (`llm` 或 `local`), 与接口改造之前一致。
+    pub specs: Vec<String>,
+    /// 外部出方案进程单次超时 (秒)。
+    pub timeout_s: u64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            specs: Vec::new(),
+            timeout_s: DEFAULT_TIMEOUT_S,
+        }
+    }
+}
+
+impl Options {
+    /// 这一次用哪个出方案的一方 (一次只许一个)。
+    pub fn spec(&self, use_llm: bool) -> Result<String> {
+        match self.specs.as_slice() {
+            [] => Ok(if use_llm { "llm" } else { "local" }.to_string()),
+            [one] if one.trim() == "llm" && !use_llm => {
+                bail!("--no-llm 与 --proposer llm 互相矛盾")
+            }
+            [one] => Ok(one.trim().to_string()),
+            many => bail!(
+                "一次只能指定一个出方案的一方, 收到 {} 个: {}",
+                many.len(),
+                many.join(", ")
+            ),
+        }
+    }
+
+    /// 计划里「谁来出主意」那一行。None = 没显式指定, 沿用计划自己的说法。
+    pub fn plan_line(&self) -> Option<String> {
+        match self.specs.as_slice() {
+            [one] => Some(describe_spec(one)),
+            _ => None,
+        }
+    }
+}
+
+/// 一次跑下来出方案一方的账: 是谁、问了几次、其中调了几次大模型。进 report.json。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Summary {
+    pub spec: String,
+    pub describe: String,
+    pub calls: u32,
+    pub model_calls: u32,
+}
+
+/// 记账用的包装: 对内原样转交, 对外多数几个数。
+pub struct Counting<'a> {
+    inner: &'a dyn Proposer,
+    calls: std::cell::Cell<u32>,
+    model_calls: std::cell::Cell<u32>,
+}
+
+impl<'a> Counting<'a> {
+    pub fn new(inner: &'a dyn Proposer) -> Self {
+        Self {
+            inner,
+            calls: Default::default(),
+            model_calls: Default::default(),
+        }
+    }
+
+    pub fn summary(&self) -> Summary {
+        Summary {
+            spec: self.inner.spec(),
+            describe: self.inner.describe(),
+            calls: self.calls.get(),
+            model_calls: self.model_calls.get(),
+        }
+    }
+}
+
+impl Proposer for Counting<'_> {
+    fn spec(&self) -> String {
+        self.inner.spec()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn propose(&self, input: &Input) -> Proposed {
+        let p = self.inner.propose(input);
+        self.calls.set(self.calls.get() + 1);
+        self.model_calls.set(self.model_calls.get() + p.model_calls);
+        p
+    }
+}
+
+/// 一代出方案的结果, 已过 harness 校验。`T` 是这一层原来用的候选类型,
+/// 层跑器拿到的东西与改造前同形 (`accepted` / `rejected` / `origin` / `llm_error`)。
+#[derive(Debug, Clone)]
+pub struct Batch<T> {
+    pub accepted: Vec<T>,
+    /// `"<改动>: <原因>"`。
+    pub rejected: Vec<String>,
+    pub origin: Option<Origin>,
+    /// 出方案出了什么岔子 (大模型挂了 / 外部进程出错)。字段名沿用改造前。
+    pub llm_error: Option<String>,
+}
+
+/// 出一代: 问出方案的一方 → harness 校验 → 输入与结果落进 `evidence_dir`。
+pub fn generation(p: &dyn Proposer, input: &Input, evidence_dir: &Path) -> Batch<Candidate> {
+    let proposed = p.propose(input);
+    let screened = screen(input, &proposed);
+    write_evidence(evidence_dir, input, &proposed, &screened);
+    Batch {
+        accepted: screened.accepted,
+        rejected: screened.rejected,
+        origin: proposed.origin,
+        llm_error: proposed.error,
+    }
+}
+
+impl Batch<Candidate> {
+    fn map<T>(self, f: impl Fn(Candidate, Origin) -> Option<T>) -> Batch<T> {
+        let origin = self.origin.unwrap_or(Origin::LocalMutation);
+        Batch {
+            accepted: self.accepted.into_iter().filter_map(|c| f(c, origin)).collect(),
+            rejected: self.rejected,
+            origin: self.origin,
+            llm_error: self.llm_error,
+        }
+    }
+
+    /// 还原成 ③ 原来的候选类型。
+    pub fn sysparam(self) -> Batch<sysparam::Proposal> {
+        self.map(|c, origin| match c.payload {
+            CandidatePayload::Sysparam { params } => Some(sysparam::Proposal {
+                why: c.why,
+                params,
+                origin,
+            }),
+            CandidatePayload::Gray { .. } => None,
+        })
+    }
+
+    /// 还原成 ② 原来的候选类型。
+    pub fn gray(self) -> Batch<gray::Proposal> {
+        self.map(|c, origin| match c.payload {
+            CandidatePayload::Gray { rewrites } => Some(gray::Proposal {
+                why: c.why,
+                rewrites,
+                origin,
+            }),
+            CandidatePayload::Sysparam { .. } => None,
+        })
+    }
+}
+
+/// 一个上过机的候选 → 一条出方案历史。
+pub fn history_item(
+    id: &str,
+    generation: u32,
+    candidate: Candidate,
+    rep: &super::eval::Report,
+    summary: Vec<String>,
+) -> HistoryItem {
+    HistoryItem {
+        candidate_id: id.to_string(),
+        generation,
+        candidate,
+        status: rep.status.clone(),
+        measurement_valid: rep.is_measurement_valid(),
+        kept: rep.kept(),
+        reason: rep.verdict.reason.clone(),
+        p_value: rep.verdict.p_value,
+        per_metric: rep.verdict.per_metric.clone().unwrap_or_default(),
+        summary,
+    }
+}
+
 /// 一次出方案的输入骨架 (不含约束与历史, 由层跑器补)。
 #[allow(clippy::too_many_arguments)]
 pub fn input_for(
