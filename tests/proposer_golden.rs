@@ -188,3 +188,32 @@ fn local_proposer_requests_match_the_pre_refactor_golden_seed_20260923() {
 fn local_proposer_requests_match_the_pre_refactor_golden_seed_7() {
     check_against_golden(7);
 }
+
+/// 外部进程出方案走完整条链路: 用仓库里给第三方的那个例子 (examples/proposers/fixed_one.py),
+/// ③ 第一代下发且只下发它给的那一个候选, ② 它不出候选, 报告里记着是谁出的、问了几次。
+#[test]
+fn the_example_external_proposer_runs_end_to_end() {
+    let root = scaffold("ext");
+    let mut cfg = config(&root, 1);
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/proposers/fixed_one.py");
+    cfg.proposer.specs = vec![format!("cmd:{}", example.display())];
+    optimize::run(&cfg).expect("外部出方案应该跑得通");
+
+    let got = requests(&root.join("out").join("requests"));
+    let names: Vec<_> = got.keys().cloned().collect();
+    assert_eq!(names, vec!["sys_g1c1.json".to_string()], "只该下发一个 ③ 候选");
+    let params = &got["sys_g1c1.json"]["payload"]["params"];
+    assert_eq!(params.as_object().unwrap().len(), 1);
+    assert!(params.get("gpu.min_pwrlevel").is_some(), "{params}");
+
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("out").join("report.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(report["proposer"]["spec"].as_str().unwrap().starts_with("cmd:"));
+    assert_eq!(report["proposer"]["model_calls"], 0);
+    // ③ 两代 (第二代回空就停) + ② 一代 (回空就停)。
+    assert_eq!(report["proposer"]["calls"], 3);
+    assert!(root.join("out/proposer/sysparam_g1.input.json").is_file());
+    std::fs::remove_dir_all(&root).ok();
+}
