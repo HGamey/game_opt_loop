@@ -148,3 +148,23 @@ game_opt_loop optimize --game 原神 --device <serial> --budget 1h --no-llm \
 
 要回答「哪个 AI 更会优化游戏」，下一步需要：交替排臂（ABAB）抵消漂移、多次重复、
 以及把两臂各自的最好改动拿出来直接做一次 A/B。
+
+---
+
+## 3. 接一种新设备 / 新平台
+
+设备这一半在 phonefarm 里：实现 `platform::Backend`，在 `platform::open` 里登记一个 serial 前缀。
+完整说明（必须实现哪些、可选的有哪些、哪些地方还直接调 adb、各平台三层能不能开以及原因）见
+phonefarm 的 [`docs/DEVICES.md`](https://github.com/BH3GEI/phonefarm/blob/main/docs/DEVICES.md)。
+
+简要结论：
+
+| 层 | Android（adb） | OpenHarmony 商用机（hdc） |
+|---|---|---|
+| ③ 系统参数 | 能，要 root | 不能：没有 root |
+| ② 渲染流程改写 | 能，要 root 且目标应用已装 | 不知道：没有设备验证过；即便有注入点，放 `.so` 也要 root |
+| ① 画面算子 | 白盒载体，或经 ② 注入 | 不能：黑盒依赖 ②，refbench 没有鸿蒙版 |
+| 测量 | 能 | 能（HiSmartPerf） |
+
+game_opt_loop 这边按 caps 摸底的结果开层（`src/optimize/caps.rs`），新平台需要在 `caps::Platform`
+和摸底探针里加上对应分支。
