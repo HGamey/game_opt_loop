@@ -63,6 +63,11 @@ pub struct Config {
     pub proposer: proposer::Options,
     /// 人工指定的计划形状 (`--layers` / `--generations` / `--children`)。
     pub shape: plan::Shape,
+    /// 游戏档案库 (`<目录>/<包名>/profile.json`)。目标包名在库里有 PASS 的档案就用它的
+    /// 负载、渲染线程和坑 —— 内置表认不出的游戏靠它直接能跑。
+    pub profiles_dir: PathBuf,
+    /// 一份刚由 `phonefarm onboard` 产出的 profile.json: 先收进档案库 (只收 PASS), 再用。
+    pub game_profile: Option<PathBuf>,
 }
 
 /// 跑完之后的落点。
@@ -112,7 +117,29 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
     // 出方案的 spec 写错了 (或与 --no-llm 矛盾) 应该在碰设备之前就停。
     let proposer_spec = cfg.proposer.spec(cfg.use_llm)?;
     let roots = games::CarrierRoots::default();
-    let target = games::resolve(&cfg.game, cfg.package.as_deref(), &roots);
+    let store = profile::Store { root: cfg.profiles_dir.clone() };
+    let mut package = cfg.package.clone();
+    if let Some(src) = cfg.game_profile.as_ref() {
+        let dst = store
+            .install(src)
+            .with_context(|| format!("收游戏档案 {} 失败", src.display()))?;
+        println!("游戏档案已收进 {}", dst.display());
+        if package.is_none() {
+            package = Some(profile::read(&dst)?.package);
+        }
+    }
+    let mut target = games::resolve(&cfg.game, package.as_deref(), &roots);
+    if let Some(pkg) = target.package.clone() {
+        if let Some(loaded) = store.find(&pkg)? {
+            if !profile::apply(&mut target, &loaded) {
+                println!(
+                    "游戏档案 {} 状态是 {}, 没用 (只用 PASS 的)",
+                    loaded.path.display(),
+                    loaded.profile.status
+                );
+            }
+        }
+    }
 
     println!("目标: {} — {}", target.display, target.resolved_via);
     if target.package.is_none() {
