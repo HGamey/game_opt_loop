@@ -22,6 +22,7 @@ pub mod eval;
 pub mod games;
 pub mod gray;
 pub mod plan;
+pub mod profile;
 pub mod proposer;
 pub mod report;
 pub mod sysparam;
@@ -294,6 +295,8 @@ fn workload_of(step: &plan::Step, caps: &caps::Caps) -> WorkloadSpec {
             seconds: None,
             frames: Some(900),
             intensity: Some(5),
+            render_comm: None,
+            enter: None,
         },
         CarrierKind::GameReplay => WorkloadSpec {
             carrier: CarrierKind::GameReplay,
@@ -301,6 +304,9 @@ fn workload_of(step: &plan::Step, caps: &caps::Caps) -> WorkloadSpec {
             seconds: Some(caps.target.workload.seconds.max(1)),
             frames: None,
             intensity: None,
+            render_comm: caps.target.workload.render_comm.clone(),
+            // 有档案 = 进门流程实测过, 接收端每次重启游戏后可以自己走回游戏场景
+            enter: caps.target.profile.as_ref().map(|_| "onboard".to_string()),
         },
         CarrierKind::Headless => WorkloadSpec {
             carrier: CarrierKind::Headless,
@@ -308,6 +314,8 @@ fn workload_of(step: &plan::Step, caps: &caps::Caps) -> WorkloadSpec {
             seconds: None,
             frames: None,
             intensity: None,
+            render_comm: None,
+            enter: None,
         },
     }
 }
