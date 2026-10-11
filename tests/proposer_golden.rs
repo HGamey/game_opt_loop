@@ -122,13 +122,15 @@ fn config(root: &Path, seed: u64) -> optimize::Config {
         seed,
         quality_reference: None,
         sysparam_probe: Some(root.join("probe.txt")),
+        proposers: vec![],
+        proposer_timeout_s: 600,
     }
 }
 
 /// 读出一个目录下全部请求 (文件名 → JSON)。
 fn requests(dir: &Path) -> BTreeMap<String, serde_json::Value> {
     let mut m = BTreeMap::new();
-    for e in std::fs::read_dir(&dir).unwrap() {
+    for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();
         if p.extension().is_some_and(|x| x == "json") {
             let v: serde_json::Value =

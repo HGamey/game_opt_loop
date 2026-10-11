@@ -21,13 +21,15 @@ pub mod eval;
 pub mod games;
 pub mod gray;
 pub mod plan;
+pub mod proposer;
 pub mod report;
 pub mod sysparam;
 
 use anyhow::{bail, Context, Result};
 use eval::{CarrierKind, Kind, Payload, Request, WorkloadSpec};
+use proposer::Proposer;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `optimize` 的配置。
 #[derive(Debug, Clone)]
@@ -56,6 +58,42 @@ pub struct Config {
     /// 那是 phonefarm 的活。接收端的探测通路接上之前, 这个参数让人可以
     /// 把已有的 probe.txt 喂进来, 把出主意那一半先跑通。
     pub sysparam_probe: Option<PathBuf>,
+    /// 出方案的一方 (`llm` / `local` / `cmd:<可执行文件>`), 见 [`proposer`]。
+    /// 空 = 按 `use_llm` 选内置 (`llm` 或 `local`), 与接口改造之前的行为一致。
+    pub proposers: Vec<String>,
+    /// 外部出方案进程单次超时 (秒)。
+    pub proposer_timeout_s: u64,
+}
+
+impl Config {
+    /// 这一次用哪个出方案的一方 (只允许一个)。
+    pub fn proposer_spec(&self) -> Result<String> {
+        match self.proposers.as_slice() {
+            [] => Ok(if self.use_llm { "llm" } else { "local" }.to_string()),
+            [one] => {
+                if one.trim() == "llm" && !self.use_llm {
+                    bail!("--no-llm 与 --proposer llm 互相矛盾");
+                }
+                Ok(one.clone())
+            }
+            many => bail!(
+                "一次只能指定一个出方案的一方, 收到 {} 个: {}",
+                many.len(),
+                many.join(", ")
+            ),
+        }
+    }
+
+    /// 按 spec 建出方案的一方。
+    pub fn build_proposer(&self, spec: &str) -> Result<Box<dyn Proposer>> {
+        proposer::from_spec(
+            spec,
+            &self.secrets,
+            self.llm_provider.as_deref(),
+            self.llm_timeout_s,
+            std::time::Duration::from_secs(self.proposer_timeout_s.max(1)),
+        )
+    }
 }
 
 /// 跑完之后的落点。
@@ -100,8 +138,35 @@ fn pick_serial(prober: &caps::Prober, want: Option<&str>) -> Result<String> {
     }
 }
 
+/// 摸底 + 排计划之后手里有的东西。真跑与对比都从这里出发。
+pub struct Prepared {
+    pub serial: String,
+    pub caps: caps::Caps,
+    pub caps_path: PathBuf,
+    pub plan: plan::Plan,
+    pub support: eval::EvalSupport,
+    pub driver: eval::EvalDriver,
+}
+
 /// 跑一次 optimize。
 pub fn run(cfg: &Config) -> Result<Outcome> {
+    let spec = cfg.proposer_spec()?;
+    // 真跑之前先把出方案的一方建出来: 写错了 spec 应该在碰设备之前就停,
+    // 而不是摸完底、排完计划才发现。--plan 不建 (它不该去碰密钥或起进程)。
+    let proposer = if cfg.plan_only {
+        None
+    } else {
+        Some(cfg.build_proposer(&spec)?)
+    };
+    let prep = prepare(cfg)?;
+    match proposer {
+        None => plan_only(cfg, &prep),
+        Some(p) => execute(cfg, &prep, p.as_ref(), &cfg.out_dir, ""),
+    }
+}
+
+/// 第 1、2 步: 摸底 (只读) + 开路排计划。
+pub fn prepare(cfg: &Config) -> Result<Prepared> {
     let roots = games::CarrierRoots::default();
     let target = games::resolve(&cfg.game, cfg.package.as_deref(), &roots);
 
@@ -149,9 +214,28 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
     // 画质真值跟着冻结条件走, 不是某一层的私有参数: 灰档的每一个改写都动画面,
     // 那一层的 psnr 约束没有真值就判不了。
     plan.conditions.quality_reference = cfg.quality_reference.clone();
+    // 显式指定了出方案的一方时, 计划里「谁来出主意」那一行照实写。
+    if let [spec] = cfg.proposers.as_slice() {
+        for s in plan.steps.iter_mut() {
+            s.proposer = proposer::describe_spec(spec);
+        }
+    }
     println!("\n{}", plan::render(&plan, &caps, Some(&support.describe())));
 
-    if cfg.plan_only {
+    Ok(Prepared {
+        serial,
+        caps,
+        caps_path,
+        plan,
+        support,
+        driver,
+    })
+}
+
+/// `--plan`: 只把计划写成报告, 不碰设备。
+fn plan_only(cfg: &Config, prep: &Prepared) -> Result<Outcome> {
+    let (plan, caps, support, caps_path) = (&prep.plan, &prep.caps, &prep.support, &prep.caps_path);
+    {
         let layers = plan
             .steps
             .iter()
@@ -176,15 +260,17 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
                 kept: 0,
                 aborted: 0,
                 eval_errors: vec![],
+                proposer_calls: 0,
+                model_calls: 0,
             })
             .chain(plan.skipped.iter().map(|s| {
                 report::LayerOutcome::unused(s.layer, s.reason.clone(), s.blockers.clone())
             }))
             .collect();
-        let r = report::build(&plan, &caps, layers, vec![], true);
-        let (json, md) = report::write(&r, &caps, &cfg.out_dir)?;
+        let r = report::build(plan, caps, layers, vec![], true);
+        let (json, md) = report::write(&r, caps, &cfg.out_dir)?;
         println!("\n报告: {json}\n      {md}");
-        return Ok(Outcome {
+        Ok(Outcome {
             caps_path: caps_path.display().to_string(),
             report_json: json,
             report_md: md,
@@ -192,31 +278,24 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
             layers_used: 0,
             candidates: 0,
             kept: 0,
-        });
+        })
     }
+}
 
-    // ---- 3. 逐层跑 ----
+/// 第 3 步: 用给定的出方案一方逐层跑, 报告写进 `out_dir`。
+///
+/// `id_prefix` 加在每个候选 id 前面 (对比模式下区分两个出方案一方的候选,
+/// 免得接收端按 id 落的证据目录互相覆盖); 单跑时为空, id 与改造前一致。
+pub fn execute(
+    cfg: &Config,
+    prep: &Prepared,
+    proposer: &dyn Proposer,
+    out_dir: &Path,
+    id_prefix: &str,
+) -> Result<Outcome> {
+    let (plan, caps) = (&prep.plan, &prep.caps);
     println!("\n[3/3] 逐层出主意 + 真机评测...");
-    let generator = if cfg.use_llm {
-        let secrets = crate::engine::generator::load_secrets(&cfg.secrets);
-        match crate::engine::generator::Generator::from_secrets_with_timeout(
-            &secrets,
-            cfg.llm_provider.as_deref(),
-            cfg.llm_timeout_s,
-        ) {
-            Ok(g) => {
-                println!("      出主意: {} (挂了退回本地变异器)", g.provider_name());
-                Some(g)
-            }
-            Err(e) => {
-                println!("      出主意: 大模型不可用 ({e}) → 全程走本地变异器");
-                None
-            }
-        }
-    } else {
-        println!("      出主意: 已按 --no-llm 关闭 → 全程走本地变异器");
-        None
-    };
+    println!("      出主意: {}", proposer.describe());
 
     let mut layers: Vec<report::LayerOutcome> = Vec::new();
     let mut archive: Vec<report::Entry> = Vec::new();
@@ -225,13 +304,15 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
         println!("\n  --- {} ---", step.layer_display);
         let ctx = LayerCtx {
             cfg,
-            caps: &caps,
-            plan: &plan,
+            caps,
+            plan,
             step,
-            generator: generator.as_ref(),
-            serial: &serial,
-            driver: &driver,
-            support: &support,
+            proposer,
+            serial: &prep.serial,
+            driver: &prep.driver,
+            support: &prep.support,
+            out_dir,
+            id_prefix,
         };
         // 一层出错不该把已经落袋的测量一起带走。跑到这里的每一份报告都
         // 代表几十分钟真机时间, 为了一个起不来的子进程把它们全丢掉,
@@ -268,13 +349,14 @@ pub fn run(cfg: &Config) -> Result<Outcome> {
         ));
     }
 
-    let r = report::build(&plan, &caps, layers, archive, false);
-    let (json, md) = report::write(&r, &caps, &cfg.out_dir)?;
+    let mut r = report::build(plan, caps, layers, archive, false);
+    r.proposer = Some(proposer.spec());
+    let (json, md) = report::write(&r, caps, out_dir)?;
     println!("\n{}", r.headline);
     println!("报告: {json}\n      {md}");
 
     Ok(Outcome {
-        caps_path: caps_path.display().to_string(),
+        caps_path: prep.caps_path.display().to_string(),
         report_json: json,
         report_md: md,
         plan_only: false,
@@ -357,6 +439,27 @@ fn per_metric_lines(r: &eval::Report) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 一个上过机的候选 → 一条出方案历史。
+fn history_item(
+    id: &str,
+    generation: u32,
+    cand: &proposer::Candidate,
+    rep: &eval::Report,
+) -> proposer::HistoryItem {
+    proposer::HistoryItem {
+        candidate_id: id.to_string(),
+        generation,
+        candidate: cand.clone(),
+        status: rep.status.clone(),
+        measurement_valid: rep.is_measurement_valid(),
+        kept: rep.kept(),
+        reason: rep.verdict.reason.clone(),
+        p_value: rep.verdict.p_value,
+        per_metric: rep.verdict.per_metric.clone().unwrap_or_default(),
+        summary: per_metric_lines(rep),
+    }
+}
+
 /// 跑一层要用到的全部东西。
 ///
 /// 收成一个结构体不是为了少敲字, 是为了让两个层跑器的签名一眼看得出
@@ -367,10 +470,12 @@ struct LayerCtx<'a> {
     caps: &'a caps::Caps,
     plan: &'a plan::Plan,
     step: &'a plan::Step,
-    generator: Option<&'a crate::engine::generator::Generator>,
+    proposer: &'a dyn Proposer,
     serial: &'a str,
     driver: &'a eval::EvalDriver,
     support: &'a eval::EvalSupport,
+    out_dir: &'a Path,
+    id_prefix: &'a str,
 }
 
 impl LayerCtx<'_> {
@@ -390,7 +495,48 @@ impl LayerCtx<'_> {
             kept: 0,
             aborted: 0,
             eval_errors: vec![],
+            proposer_calls: 0,
+            model_calls: 0,
         }
+    }
+
+    /// 出一代方案: 组输入 → 出方案的一方 → harness 校验 → 记账 + 落证据。
+    /// 返回过了校验、可以上机的候选。
+    fn propose(
+        &self,
+        generation: u32,
+        constraints: &proposer::Constraints,
+        history: &[proposer::HistoryItem],
+        out: &mut report::LayerOutcome,
+        origins: &mut Vec<sysparam::Origin>,
+    ) -> Vec<proposer::Candidate> {
+        let input = proposer::input_for(
+            self.step,
+            self.caps,
+            self.plan,
+            generation,
+            self.cfg.seed,
+            device_note(self.caps),
+            workload_note(self.caps),
+            constraints.clone(),
+            history.to_vec(),
+        );
+        let proposed = self.proposer.propose(&input);
+        let screened = proposer::screen(&input, &proposed);
+        proposer::write_evidence(&self.out_dir.join("proposer"), &input, &proposed, &screened);
+
+        record_proposer(
+            out,
+            origins,
+            proposed.origin,
+            proposed.error.as_ref(),
+            &self.proposer.spec(),
+        );
+        out.proposer_calls += 1;
+        out.model_calls += proposed.model_calls as usize;
+        out.proposed += screened.accepted.len() + screened.rejected.len();
+        out.rejected_locally.extend(screened.rejected);
+        screened.accepted
     }
 
     /// 接收端认不认统一测评接口。
@@ -415,11 +561,7 @@ impl LayerCtx<'_> {
 
     /// 下发一个候选。失败只回 Err, 由调用方记进 `eval_errors` 并接着跑下一个。
     fn evaluate(&self, id: &str, req: &Request) -> Result<eval::Report> {
-        let path = self
-            .cfg
-            .out_dir
-            .join("requests")
-            .join(format!("{id}.json"));
+        let path = self.out_dir.join("requests").join(format!("{id}.json"));
         self.driver.evaluate(req, &path)
     }
 }
@@ -433,19 +575,20 @@ fn record_proposer(
     origins: &mut Vec<sysparam::Origin>,
     origin: Option<sysparam::Origin>,
     llm_error: Option<&String>,
+    spec: &str,
 ) {
     if let Some(o) = origin {
         origins.push(o);
     }
-    let llm = origins
-        .iter()
-        .filter(|o| **o == sysparam::Origin::Llm)
-        .count();
-    let local = origins.len() - llm;
-    out.proposer = Some(match (llm, local) {
-        (0, _) => "本地确定性变异器".to_string(),
-        (_, 0) => "大模型".to_string(),
-        (l, n) => format!("大模型 {l} 代 / 本地变异器 {n} 代"),
+    let count = |want: sysparam::Origin| origins.iter().filter(|o| **o == want).count();
+    let (llm, ext) = (count(sysparam::Origin::Llm), count(sysparam::Origin::External));
+    let local = origins.len() - llm - ext;
+    out.proposer = Some(match (llm, local, ext) {
+        (0, 0, e) if e > 0 => format!("外部进程 {spec}"),
+        (0, _, 0) => "本地确定性变异器".to_string(),
+        (_, 0, 0) => "大模型".to_string(),
+        (l, n, 0) => format!("大模型 {l} 代 / 本地变异器 {n} 代"),
+        (l, n, e) => format!("大模型 {l} 代 / 本地变异器 {n} 代 / 外部进程 {spec} {e} 代"),
     });
     // LLM 的岔子留第一条: 后面几代多半是同一个原因, 覆盖成最后一条会让
     // "第一次为什么降级"这个真正有用的信息丢掉。
@@ -512,27 +655,13 @@ fn run_sysparam(
         return Ok(o);
     }
 
-    let proposer = sysparam::Proposer {
-        generator: ctx.generator,
-        seed: ctx.cfg.seed,
-    };
-    let mut history: Vec<sysparam::History> = Vec::new();
+    let constraints = proposer::constraints_for(Kind::Sysparam, Some(&wl));
+    let mut history: Vec<proposer::HistoryItem> = Vec::new();
     let mut origins: Vec<sysparam::Origin> = Vec::new();
 
     for gen in 1..=ctx.step.generations {
-        let batch = proposer.propose(
-            &device_note(ctx.caps),
-            &workload_note(ctx.caps),
-            &wl,
-            &history,
-            ctx.step.children,
-        );
-        record_proposer(&mut out, &mut origins, batch.origin, batch.llm_error.as_ref());
-        out.proposed += batch.accepted.len() + batch.rejected.len();
-        for (p, why) in &batch.rejected {
-            out.rejected_locally.push(format!("{p:?}: {why}"));
-        }
-        if batch.accepted.is_empty() {
+        let accepted = ctx.propose(gen, &constraints, &history, &mut out, &mut origins);
+        if accepted.is_empty() {
             // 提不出新东西就停, 不空转剩下的代数。
             let note = format!("第 {gen} 代一个可用候选都没提出来, 这一层到此为止");
             println!("      {note}");
@@ -540,9 +669,10 @@ fn run_sysparam(
             break;
         }
 
-        for (i, prop) in batch.accepted.iter().enumerate() {
-            let id = format!("sys_g{gen}c{}", i + 1);
-            println!("      {id}: {} 项 — {}", prop.params.len(), prop.why);
+        for (i, cand) in accepted.iter().enumerate() {
+            let id = format!("{}sys_g{gen}c{}", ctx.id_prefix, i + 1);
+            let Some(params) = cand.params() else { continue };
+            println!("      {id}: {} 项 — {}", params.len(), cand.why);
 
             let req = Request {
                 version: eval::REQUEST_VERSION,
@@ -554,9 +684,9 @@ fn run_sysparam(
                 conditions: ctx.plan.conditions.clone(),
                 protocol: plan::protocol_for(ctx.step, ctx.caps),
                 payload: Payload::Sysparam(eval::SysparamPayload {
-                    why: Some(prop.why.clone()),
-                    params: prop.params.clone(),
-                    plan: sysparam::plan(&prop.params, &wl),
+                    why: Some(cand.why.clone()),
+                    params: params.clone(),
+                    plan: sysparam::plan(params, &wl),
                     whitelist: Some(wl.clone()),
                     deny_keywords: sysparam::DENY_KEYWORDS
                         .iter()
@@ -587,23 +717,17 @@ fn run_sysparam(
                 if rep.kept() { " 留下" } else { "" }
             );
 
-            // 只有量准了的才喂回给出主意的一方。ABORT 什么都没测到,
-            // 把它当成"这组不行"会让模型学到一条不存在的规律。
-            if rep.is_measurement_valid() {
-                history.push(sysparam::History {
-                    params: prop.params.clone(),
-                    verdict: rep.status.clone(),
-                    reason: rep.verdict.reason.clone().unwrap_or_default(),
-                    per_metric: per_metric_lines(&rep),
-                });
-            }
+            // 上过机的都进历史, 连 ABORT 一起, 带着 measurement_valid。
+            // 内置出方案在还原历史时只取量准了的 (proposer::sysparam_history) ——
+            // ABORT 什么都没测到, 当成"这组不行"会让模型学到一条不存在的规律。
+            history.push(history_item(&id, gen, cand, &rep));
             archive.push(report::Entry::from_report(
                 id,
                 Kind::Sysparam,
                 gen,
-                prop.why.clone(),
+                cand.why.clone(),
                 report::Change::Sysparam {
-                    params: prop.params.clone(),
+                    params: params.clone(),
                 },
                 &rep,
             ));
@@ -637,25 +761,13 @@ fn run_gray(ctx: &LayerCtx<'_>, archive: &mut Vec<report::Entry>) -> Result<repo
         return Ok(o);
     }
 
-    let proposer = gray::Proposer {
-        generator: ctx.generator,
-    };
-    let mut history: Vec<sysparam::History> = Vec::new();
+    let constraints = proposer::constraints_for(Kind::Gray, None);
+    let mut history: Vec<proposer::HistoryItem> = Vec::new();
     let mut origins: Vec<sysparam::Origin> = Vec::new();
 
     for gen in 1..=ctx.step.generations {
-        let batch = proposer.propose(
-            &device_note(ctx.caps),
-            &workload_note(ctx.caps),
-            &history,
-            ctx.step.children,
-        );
-        record_proposer(&mut out, &mut origins, batch.origin, batch.llm_error.as_ref());
-        out.proposed += batch.accepted.len() + batch.rejected.len();
-        for (k, why) in &batch.rejected {
-            out.rejected_locally.push(format!("{k}: {why}"));
-        }
-        if batch.accepted.is_empty() {
+        let accepted = ctx.propose(gen, &constraints, &history, &mut out, &mut origins);
+        if accepted.is_empty() {
             // 层里已实现的开关是有限的, 试完就没了。这时候停下来说清楚,
             // 比把同一个候选再上机一遍诚实。
             let note = format!(
@@ -666,10 +778,11 @@ fn run_gray(ctx: &LayerCtx<'_>, archive: &mut Vec<report::Entry>) -> Result<repo
             break;
         }
 
-        for (i, prop) in batch.accepted.iter().enumerate() {
-            let id = format!("gray_g{gen}c{}", i + 1);
-            let knobs: Vec<String> = prop.rewrites.iter().map(|r| r.knob.clone()).collect();
-            println!("      {id}: {} — {}", knobs.join("+"), prop.why);
+        for (i, cand) in accepted.iter().enumerate() {
+            let id = format!("{}gray_g{gen}c{}", ctx.id_prefix, i + 1);
+            let Some(rewrites) = cand.rewrites() else { continue };
+            let knobs: Vec<String> = rewrites.iter().map(|r| r.knob.clone()).collect();
+            println!("      {id}: {} — {}", knobs.join("+"), cand.why);
 
             let req = Request {
                 version: eval::REQUEST_VERSION,
@@ -681,9 +794,9 @@ fn run_gray(ctx: &LayerCtx<'_>, archive: &mut Vec<report::Entry>) -> Result<repo
                 conditions: ctx.plan.conditions.clone(),
                 protocol: plan::protocol_for(ctx.step, ctx.caps),
                 payload: Payload::Gray(eval::GrayPayload {
-                    why: Some(prop.why.clone()),
+                    why: Some(cand.why.clone()),
                     layer: None,
-                    rewrites: prop.rewrites.clone(),
+                    rewrites: rewrites.to_vec(),
                     // 改写没命中却当成有效样本 = 拿 A 去和 A 比, 稳定产出假阴性。
                     require_hit: true,
                     side_effect_ack: Some(
@@ -715,22 +828,13 @@ fn run_gray(ctx: &LayerCtx<'_>, archive: &mut Vec<report::Entry>) -> Result<repo
             );
 
             // 不管量没量准, 这些开关都算"提过了" —— 否则下一代会原样再提一遍,
-            // 换回来的是同一个候选在真机上再跑一轮。
-            history.push(sysparam::History {
-                params: knobs.iter().map(|k| (k.clone(), "on".to_string())).collect(),
-                verdict: rep.status.clone(),
-                reason: format!("{} — {}", knobs.join("+"), prop.why),
-                per_metric: if rep.is_measurement_valid() {
-                    per_metric_lines(&rep)
-                } else {
-                    vec!["这一轮没量准 (ABORT), 数字不算数".into()]
-                },
-            });
+            // 换回来的是同一个候选在真机上再跑一轮 (见 proposer::gray_history)。
+            history.push(history_item(&id, gen, cand, &rep));
             archive.push(report::Entry::from_report(
                 id,
                 Kind::Gray,
                 gen,
-                prop.why.clone(),
+                cand.why.clone(),
                 report::Change::Gray { rewrites: knobs },
                 &rep,
             ));

@@ -136,6 +136,12 @@ pub struct LayerOutcome {
     /// 这里是"根本没跑成"。一个候选炸了不该把前面几小时的测量一起带走,
     /// 所以它只进这份清单, 不往上抛。
     pub eval_errors: Vec<String>,
+    /// 这一层问了出方案的一方几次 (一代一次)。
+    #[serde(default)]
+    pub proposer_calls: usize,
+    /// 其中调了几次大模型 (经费口径)。
+    #[serde(default)]
+    pub model_calls: usize,
 }
 
 impl LayerOutcome {
@@ -155,6 +161,8 @@ impl LayerOutcome {
             kept: 0,
             aborted: 0,
             eval_errors: Vec::new(),
+            proposer_calls: 0,
+            model_calls: 0,
         }
     }
 }
@@ -182,6 +190,9 @@ pub struct Report {
     pub headline: String,
     /// 这份报告里的数字来自哪里。
     pub disclaimer: &'static str,
+    /// 出方案的一方 (`llm` / `local` / `cmd:...`)。`--plan` 时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposer: Option<String>,
 }
 
 pub const DISCLAIMER: &str = "档案里的每个数字都来自 phonefarm 的真机采样与冻结规则判定。\
@@ -249,6 +260,7 @@ pub fn build(
         kept,
         headline,
         disclaimer: DISCLAIMER,
+        proposer: None,
     }
 }
 
