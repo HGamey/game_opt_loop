@@ -1,5 +1,7 @@
 # game_opt_loop
 
+> **已合并进 [HGamey/hgamey](https://github.com/HGamey/hgamey)（2026-10-28 起），本仓库只读归档。** 代码与完整历史在 hgamey 的 `game_opt_loop/` 目录，旧提交号到新提交号的对照见 `history/game_opt_loop.commit-map`；尚未并入 main 的分支已导入为 hgamey 的 `game_opt_loop/<原分支名>`（有冲突的为 `archive/game_opt_loop/<原分支名>`），见 `history/branches.md`。新的提交、问题和部署都在 hgamey 进行。
+
 外部 Agent 可选的游戏优化方法客户端（Rust）：候选生成、方法编排及与 [phonefarm](https://github.com/HGamey/phonefarm) 的实验对接。[harness-ops](https://github.com/HGamey/harness-ops) 的网页与 CLI/API 提供共享研究状态和异步人工协助；研究方向与优先级由外部 Agent 决定。
 
 ## 构建与运行
